@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Product - TESTING</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;700&display=swap">
+<style>
+:root { --bg:#050810; --card:#0a0f1ab3; --border:#8892b026; --text:#f0f4ff; --muted:#8892b0; --red:#ff4d4d; --cyan:#00e5cc; }
+html,body{margin:0;padding:0;background:#050810;color:var(--text);font-family:Satoshi,Noto Sans,system-ui,sans-serif;min-height:100vh;}
+a{color:inherit;text-decoration:none}
+.wrap{max-width:1100px;margin:0 auto;padding:32px 16px 80px;}
+.nav{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:14px;margin-bottom:24px;}
+.nav a:hover{color:#fff}
+.grid{display:grid;gap:28px;grid-template-columns:1fr;}
+@media(min-width:900px){.grid{grid-template-columns:1fr 1fr;}}
+.card{border:1px solid var(--border);border-radius:16px;background:var(--card);overflow:hidden;}
+.img-wrap{aspect-ratio:1/1;background:#000;display:flex;align-items:center;justify-content:center;}
+.img-wrap img{width:100%;height:100%;object-fit:contain;background:#000;}
+.info{padding:24px;}
+h1{margin:0 0 12px;font-family:"Clash Display",system-ui,sans-serif;font-size:26px;}
+.desc{color:var(--muted);font-size:14.5px;line-height:1.6;margin-bottom:20px;}
+.price{font-size:24px;font-weight:700;color:var(--red);margin-bottom:18px;}
+.label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px;font-weight:600;}
+.req{color:var(--red)}
+.input, textarea{
+  width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);
+  background:#05081099;color:#fff;font-size:14px;margin-bottom:14px;box-sizing:border-box;
+}
+textarea{min-height:90px;resize:vertical}
+.qty-row{display:flex;align-items:center;gap:12px;margin-bottom:16px;}
+.qty-box{display:flex;align-items:center;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#05081099;}
+.qty-box button{background:transparent;border:none;color:var(--muted);padding:10px 14px;cursor:pointer;font-size:16px;}
+.qty-box input{width:56px;text-align:center;border:none;background:transparent;color:#fff;font-size:14px;}
+.btn-buy{
+  width:100%;padding:14px;border:none;border-radius:12px;cursor:pointer;
+  background:linear-gradient(135deg,#ff4d4d,#991b1b);color:#fff;font-weight:700;font-size:15px;
+  font-family:"Clash Display",system-ui,sans-serif;margin-bottom:10px;
+}
+.btn-secondary{
+  width:100%;padding:14px;border-radius:12px;cursor:pointer;border:1px solid var(--red);
+  background:transparent;color:var(--red);font-weight:700;font-size:15px;
+}
+.stock{font-size:13px;color:var(--muted);margin-bottom:12px;}
+.oos{color:var(--red);font-weight:600;}
+.msg{margin-top:10px;font-size:13px;display:none;}
+.back{color:var(--cyan);}
+</style>
+</head>
+<body>
+
+<script>
+(function(){
+  // ===== SHARED CLOUD STORE (all users on the link) =====
+  var BLOB_KEY = 'testing_cloud_blob_id';
+  var CACHE_KEY = 'testing_cloud_cache';
+  var META_KEY = 'testing_cloud_meta';
+  var API = 'https://jsonblob.com/api/jsonBlob';
+  var SAVE_DEBOUNCE_MS = 800;
+  var PULL_MS = 4000;
+  var saveTimer = null;
+  var pulling = false;
+  var applying = false;
+
+  function defaultData(){
+    return {
+      users: [],
+      products: [],
+      orders: [],
+      transactions: [],
+      siteEdits: {},
+      adminSettings: {},
+      updatedAt: Date.now()
+    };
+  }
+
+  function readLocalBundle(){
+    var data = defaultData();
+    try { data.users = JSON.parse(localStorage.getItem('testing_users')||'[]')||[]; } catch(e){}
+    try { data.products = JSON.parse(localStorage.getItem('testing_products')||'[]')||[]; } catch(e){}
+    try { data.orders = JSON.parse(localStorage.getItem('testing_orders')||'[]')||[]; } catch(e){}
+    try { data.transactions = JSON.parse(localStorage.getItem('testing_transactions')||'[]')||[]; } catch(e){}
+    try { data.adminSettings = JSON.parse(localStorage.getItem('testing_admin_settings')||'{}')||{}; } catch(e){}
+    // collect all site edit keys
+    data.siteEdits = {};
+    try {
+      for (var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if (k && k.indexOf('testing_site_edits')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+        if (k && k.indexOf('testing_page_edits_')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+      }
+    } catch(e){}
+    data.updatedAt = Date.now();
+    return data;
+  }
+
+  function writeLocalBundle(data, skipAuth){
+    if (!data || typeof data !== 'object') return;
+    applying = true;
+    try {
+      if (Array.isArray(data.users)) localStorage.setItem('testing_users', JSON.stringify(data.users));
+      if (Array.isArray(data.products)) localStorage.setItem('testing_products', JSON.stringify(data.products));
+      if (Array.isArray(data.orders)) localStorage.setItem('testing_orders', JSON.stringify(data.orders));
+      if (Array.isArray(data.transactions)) localStorage.setItem('testing_transactions', JSON.stringify(data.transactions));
+      if (data.adminSettings) localStorage.setItem('testing_admin_settings', JSON.stringify(data.adminSettings));
+      if (data.siteEdits && typeof data.siteEdits === 'object') {
+        Object.keys(data.siteEdits).forEach(function(k){
+          try { localStorage.setItem(k, JSON.stringify(data.siteEdits[k])); } catch(e){}
+        });
+      }
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      localStorage.setItem(META_KEY, JSON.stringify({ updatedAt: data.updatedAt||Date.now() }));
+    } catch(e){}
+    applying = false;
+  }
+
+  function getBlobId(){ return localStorage.getItem(BLOB_KEY) || ''; }
+  function setBlobId(id){ if (id) localStorage.setItem(BLOB_KEY, id); }
+
+  async function createBlob(data){
+    var res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('create failed '+res.status);
+    // Location header: https://jsonblob.com/api/jsonBlob/{id}
+    var loc = res.headers.get('Location') || res.headers.get('location') || '';
+    var id = loc.split('/').pop();
+    if (!id) {
+      try { var j = await res.json(); id = j.id || j.blobId; } catch(e){}
+    }
+    if (!id) throw new Error('no blob id');
+    setBlobId(id);
+    return id;
+  }
+
+  async function putBlob(id, data){
+    var res = await fetch(API + '/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (res.status === 404) {
+      // recreate
+      return createBlob(data);
+    }
+    if (!res.ok) throw new Error('put failed '+res.status);
+    return id;
+  }
+
+  async function getBlob(id){
+    var res = await fetch(API + '/' + id, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error('get failed '+res.status);
+    return await res.json();
+  }
+
+  async function pushNow(){
+    if (applying) return;
+    var data = readLocalBundle();
+    try {
+      var id = getBlobId();
+      if (!id) id = await createBlob(data);
+      else id = await putBlob(id, data);
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      showSync('Synced to cloud', true);
+      return id;
+    } catch(e) {
+      console.warn('cloud push failed', e);
+      showSync('Cloud sync failed (will retry)', false);
+    }
+  }
+
+  function schedulePush(){
+    if (applying) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function(){ pushNow(); }, SAVE_DEBOUNCE_MS);
+  }
+
+  async function pullNow(forceApply){
+    if (pulling) return;
+    pulling = true;
+    try {
+      var id = getBlobId();
+      // If no id yet, try from URL param shared by admin
+      if (!id) {
+        var params = new URLSearchParams(location.search);
+        var qid = params.get('cloud') || params.get('sync');
+        if (qid) { setBlobId(qid); id = qid; }
+      }
+      if (!id) {
+        // first visitor creates the cloud store from local
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var remote = await getBlob(id);
+      if (!remote) {
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var meta = {};
+      try { meta = JSON.parse(localStorage.getItem(META_KEY)||'{}'); } catch(e){}
+      var remoteAt = Number(remote.updatedAt||0);
+      var localAt = Number(meta.updatedAt||0);
+      if (forceApply || remoteAt >= localAt) {
+        writeLocalBundle(remote);
+        // re-render dynamic bits if available
+        if (typeof window.__siteEditRestore === 'function') try { window.__siteEditRestore(); } catch(e){}
+        // soft reload products grid if function exists
+        if (document.getElementById('products-grid')) {
+          // trigger storage event consumers
+          try { window.dispatchEvent(new Event('testing-cloud-pull')); } catch(e){}
+        }
+      }
+    } catch(e) {
+      console.warn('cloud pull failed', e);
+    }
+    pulling = false;
+  }
+
+  function showSync(msg, ok){
+    var el = document.getElementById('cloud-sync-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'cloud-sync-toast';
+      el.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:100002;padding:8px 12px;border-radius:10px;font-size:12px;opacity:0;transition:opacity .25s;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    el.style.background = ok ? '#0a2a24' : '#2a0a0a';
+    el.style.border = ok ? '1px solid #00e5cc55' : '1px solid #ff4d4d55';
+    el.style.color = ok ? '#00e5cc' : '#ff4d4d';
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(window.__cloudToastTimer);
+    window.__cloudToastTimer = setTimeout(function(){ el.style.opacity = '0'; }, 1800);
+  }
+
+  // Patch localStorage setItem for our keys to auto-push
+  try {
+    var _set = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function(k, v){
+      _set(k, v);
+      if (applying) return;
+      if (!k) return;
+      if (k.indexOf('testing_') === 0 && k !== CACHE_KEY && k !== META_KEY && k !== BLOB_KEY && k !== 'testing_orders_wiped_v2') {
+        schedulePush();
+      }
+    };
+  } catch(e){}
+
+  // Expose API
+  window.TestingCloud = {
+    push: pushNow,
+    pull: pullNow,
+    getBlobId: getBlobId,
+    setBlobId: setBlobId,
+    shareUrl: function(){
+      var id = getBlobId();
+      if (!id) return location.href;
+      var u = new URL(location.href);
+      u.searchParams.set('cloud', id);
+      return u.toString();
+    }
+  };
+
+  // Admin: show cloud id + force sync buttons when panel opens
+  document.addEventListener('DOMContentLoaded', function(){
+    // inject share helpers into admin if present later
+  });
+
+  // Boot: pull then periodic pull
+  pullNow(true).then(function(){
+    // After first pull, if products empty seed still works via existing scripts
+  });
+  setInterval(function(){ pullNow(false); }, PULL_MS);
+
+  // Save site edits button should push
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    if (!t) return;
+    if (t.id === 'edit-save-btn' || (t.closest && t.closest('#edit-save-btn'))) {
+      setTimeout(function(){ pushNow(); }, 100);
+    }
+  });
+})();
+</script>
+
+<div class="wrap">
+  <nav class="nav">
+    <a class="back" href="smscode-dashboard.html">← Dashboard</a>
+    <span>/</span>
+    <span id="crumb">Product</span>
+  </nav>
+  <div class="grid" id="product-root">
+    <div class="card">
+      <div class="img-wrap"><img id="p-img" alt="" src=""></div>
+    </div>
+    <div class="card">
+      <div class="info">
+        <h1 id="p-name">Product</h1>
+        <div class="desc" id="p-desc"></div>
+        <div class="price" id="p-price">$0.00</div>
+        <div class="stock" id="p-stock"></div>
+        <form id="order-form">
+          <div id="custom-fields"></div>
+          <div class="qty-row">
+            <span class="label" style="margin:0">Quantity</span>
+            <div class="qty-box">
+              <button type="button" id="qty-minus">−</button>
+              <input type="number" id="qty" value="1" min="1">
+              <button type="button" id="qty-plus">+</button>
+            </div>
+          </div>
+          <button class="btn-buy" type="submit" id="btn-order">Buy Now</button>
+          <div class="msg" id="msg"></div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  function getProducts(){
+    try { var p=JSON.parse(localStorage.getItem('testing_products')||'[]'); return Array.isArray(p)?p:[]; } catch(e){ return []; }
+  }
+  function saveProducts(p){ localStorage.setItem('testing_products', JSON.stringify(p)); }
+  function getUsers(){ try{return JSON.parse(localStorage.getItem('testing_users')||'[]');}catch(e){return [];} }
+  function getAuth(){ try{return JSON.parse(localStorage.getItem('testing_auth')||'null');}catch(e){return null;} }
+  function getOrders(){ try{var o=JSON.parse(localStorage.getItem('testing_orders')||'[]');return Array.isArray(o)?o:[];}catch(e){return [];} }
+  function saveOrders(o){ localStorage.setItem('testing_orders', JSON.stringify(o)); }
+  function newOrderId(){ return 'ORD-'+Date.now().toString(36).toUpperCase()+'-'+Math.floor(Math.random()*9999); }
+
+  var params = new URLSearchParams(location.search);
+  var id = params.get('id') || '';
+  var products = getProducts();
+  var product = products.find(function(p){ return p.id === id; });
+  if (!product) {
+    document.getElementById('product-root').innerHTML = '<p style="color:#ff4d4d">Product not found. <a class="back" href="smscode-dashboard.html">Back</a></p>';
+    return;
+  }
+
+  document.title = product.name + ' - TESTING';
+  document.getElementById('crumb').textContent = product.name;
+  document.getElementById('p-name').textContent = product.name;
+  document.getElementById('p-desc').textContent = product.desc || '';
+  document.getElementById('p-price').textContent = product.price > 0 ? ('$'+Number(product.price).toFixed(2)) : 'By tier';
+  document.getElementById('p-img').src = product.image || '';
+  document.getElementById('p-img').alt = product.name;
+
+  var stock = Number(product.stock||0);
+  var stockEl = document.getElementById('p-stock');
+  if (stock <= 0) {
+    stockEl.innerHTML = '<span class="oos">Out of stock</span>';
+    document.getElementById('btn-order').disabled = true;
+    document.getElementById('btn-order').style.opacity = '0.5';
+  } else {
+    stockEl.textContent = 'In stock: ' + stock;
+  }
+
+  var fieldsWrap = document.getElementById('custom-fields');
+  (product.fields || []).forEach(function(f, i){
+    var lab = document.createElement('label');
+    lab.className = 'label';
+    lab.innerHTML = (f.label||'Field') + (f.required ? ' <span class="req">*</span>' : '');
+    fieldsWrap.appendChild(lab);
+    var input;
+    if (f.type === 'textarea') {
+      input = document.createElement('textarea');
+      input.placeholder = f.placeholder || '';
+    } else {
+      input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = f.placeholder || '';
+    }
+    input.className = 'input';
+    input.dataset.idx = i;
+    if (f.required) input.required = true;
+    fieldsWrap.appendChild(input);
+  });
+
+  var qty = document.getElementById('qty');
+  qty.max = Math.max(1, stock);
+  document.getElementById('qty-minus').onclick = function(){ qty.value = Math.max(1, (parseInt(qty.value)||1)-1); };
+  document.getElementById('qty-plus').onclick = function(){
+    var max = Math.max(1, stock);
+    qty.value = Math.min(max, (parseInt(qty.value)||1)+1);
+  };
+
+  document.getElementById('order-form').onsubmit = function(e){
+    e.preventDefault();
+    var auth = getAuth();
+    if (!auth || !auth.loggedIn) { alert('Please log in first'); location.href='index.html'; return; }
+    var q = parseInt(qty.value)||1;
+    if (q < 1) q = 1;
+    if (stock <= 0) { show('Out of stock', false); return; }
+    if (q > stock) { show('Only ' + stock + ' in stock', false); qty.value = stock; return; }
+
+    var answers = [];
+    fieldsWrap.querySelectorAll('input,textarea').forEach(function(el, i){
+      var f = (product.fields||[])[i] || {};
+      answers.push({ label: f.label||('Field '+(i+1)), value: el.value });
+    });
+
+    var users = getUsers();
+    var user = users.find(function(u){ return (u.email||'').toLowerCase() === (auth.email||'').toLowerCase(); });
+
+    var orders = getOrders();
+    orders.unshift({
+      id: newOrderId(),
+      service: product.name,
+      productId: product.id,
+      country: 'N/A',
+      amount: Number(product.price||0) * q,
+      qty: q,
+      status: 'PENDING_ADMIN',
+      progress: 0,
+      clientEmail: auth.email,
+      clientName: (user&&user.name)||auth.name||auth.email,
+      clientId: (user&&user.userId)||auth.userId||'',
+      sellerEmail: product.sellerEmail || null,
+      sellerName: product.sellerName || null,
+      answers: answers,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+    saveOrders(orders);
+
+    // decrease stock
+    var products = getProducts();
+    var idx = products.findIndex(function(p){ return p.id === product.id; });
+    if (idx >= 0) {
+      products[idx].stock = Math.max(0, Number(products[idx].stock||0) - q);
+      saveProducts(products);
+      stock = products[idx].stock;
+      stockEl.textContent = stock > 0 ? ('In stock: ' + stock) : '';
+      if (stock <= 0) {
+        stockEl.innerHTML = '<span class="oos">Out of stock</span>';
+        document.getElementById('btn-order').disabled = true;
+      }
+      qty.max = Math.max(1, stock);
+    }
+
+    show('Order placed! Waiting for admin approval.', true);
+    setTimeout(function(){ location.href='orders-page.html'; }, 900);
+  };
+
+  function show(t, ok){
+    var m = document.getElementById('msg');
+    m.style.display='block'; m.style.color = ok ? '#00e5cc' : '#ff4d4d'; m.textContent = t;
+  }
+})();
+</script>
+
+<script>
+(function(){
+  try {
+    if (localStorage.getItem('testing_orders_wiped_v2') !== '1' && !localStorage.getItem('testing_cloud_blob_id')) {
+      localStorage.setItem('testing_orders', '[]');
+      localStorage.setItem('testing_orders_wiped_v2', '1');
+    }
+  } catch(e) {}
+})();
+</script>
+
+</body>
+</html>

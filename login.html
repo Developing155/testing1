@@ -1,0 +1,1315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TESTING - Sign In</title>
+  <style>
+    :root { --bg-deep: #050810; --coral-bright: #ff4d4d; --coral-dark: #991b1b; --cyan-bright: #00e5cc; }
+    html, body { margin: 0; padding: 0; background: #050810 !important; color: #f0f4ff; min-height: 100vh; }
+  </style>
+</head>
+<body>
+
+<script>
+(function(){
+  // ===== SHARED CLOUD STORE (all users on the link) =====
+  var BLOB_KEY = 'testing_cloud_blob_id';
+  var CACHE_KEY = 'testing_cloud_cache';
+  var META_KEY = 'testing_cloud_meta';
+  var API = 'https://jsonblob.com/api/jsonBlob';
+  var SAVE_DEBOUNCE_MS = 800;
+  var PULL_MS = 4000;
+  var saveTimer = null;
+  var pulling = false;
+  var applying = false;
+
+  function defaultData(){
+    return {
+      users: [],
+      products: [],
+      orders: [],
+      transactions: [],
+      siteEdits: {},
+      adminSettings: {},
+      updatedAt: Date.now()
+    };
+  }
+
+  function readLocalBundle(){
+    var data = defaultData();
+    try { data.users = JSON.parse(localStorage.getItem('testing_users')||'[]')||[]; } catch(e){}
+    try { data.products = JSON.parse(localStorage.getItem('testing_products')||'[]')||[]; } catch(e){}
+    try { data.orders = JSON.parse(localStorage.getItem('testing_orders')||'[]')||[]; } catch(e){}
+    try { data.transactions = JSON.parse(localStorage.getItem('testing_transactions')||'[]')||[]; } catch(e){}
+    try { data.adminSettings = JSON.parse(localStorage.getItem('testing_admin_settings')||'{}')||{}; } catch(e){}
+    // collect all site edit keys
+    data.siteEdits = {};
+    try {
+      for (var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if (k && k.indexOf('testing_site_edits')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+        if (k && k.indexOf('testing_page_edits_')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+      }
+    } catch(e){}
+    data.updatedAt = Date.now();
+    return data;
+  }
+
+  function writeLocalBundle(data, skipAuth){
+    if (!data || typeof data !== 'object') return;
+    applying = true;
+    try {
+      if (Array.isArray(data.users)) localStorage.setItem('testing_users', JSON.stringify(data.users));
+      if (Array.isArray(data.products)) localStorage.setItem('testing_products', JSON.stringify(data.products));
+      if (Array.isArray(data.orders)) localStorage.setItem('testing_orders', JSON.stringify(data.orders));
+      if (Array.isArray(data.transactions)) localStorage.setItem('testing_transactions', JSON.stringify(data.transactions));
+      if (data.adminSettings) localStorage.setItem('testing_admin_settings', JSON.stringify(data.adminSettings));
+      if (data.siteEdits && typeof data.siteEdits === 'object') {
+        Object.keys(data.siteEdits).forEach(function(k){
+          try { localStorage.setItem(k, JSON.stringify(data.siteEdits[k])); } catch(e){}
+        });
+      }
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      localStorage.setItem(META_KEY, JSON.stringify({ updatedAt: data.updatedAt||Date.now() }));
+    } catch(e){}
+    applying = false;
+  }
+
+  function getBlobId(){ return localStorage.getItem(BLOB_KEY) || ''; }
+  function setBlobId(id){ if (id) localStorage.setItem(BLOB_KEY, id); }
+
+  async function createBlob(data){
+    var res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('create failed '+res.status);
+    // Location header: https://jsonblob.com/api/jsonBlob/{id}
+    var loc = res.headers.get('Location') || res.headers.get('location') || '';
+    var id = loc.split('/').pop();
+    if (!id) {
+      try { var j = await res.json(); id = j.id || j.blobId; } catch(e){}
+    }
+    if (!id) throw new Error('no blob id');
+    setBlobId(id);
+    return id;
+  }
+
+  async function putBlob(id, data){
+    var res = await fetch(API + '/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (res.status === 404) {
+      // recreate
+      return createBlob(data);
+    }
+    if (!res.ok) throw new Error('put failed '+res.status);
+    return id;
+  }
+
+  async function getBlob(id){
+    var res = await fetch(API + '/' + id, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error('get failed '+res.status);
+    return await res.json();
+  }
+
+  async function pushNow(){
+    if (applying) return;
+    var data = readLocalBundle();
+    try {
+      var id = getBlobId();
+      if (!id) id = await createBlob(data);
+      else id = await putBlob(id, data);
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      showSync('Synced to cloud', true);
+      return id;
+    } catch(e) {
+      console.warn('cloud push failed', e);
+      showSync('Cloud sync failed (will retry)', false);
+    }
+  }
+
+  function schedulePush(){
+    if (applying) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function(){ pushNow(); }, SAVE_DEBOUNCE_MS);
+  }
+
+  async function pullNow(forceApply){
+    if (pulling) return;
+    pulling = true;
+    try {
+      var id = getBlobId();
+      // If no id yet, try from URL param shared by admin
+      if (!id) {
+        var params = new URLSearchParams(location.search);
+        var qid = params.get('cloud') || params.get('sync');
+        if (qid) { setBlobId(qid); id = qid; }
+      }
+      if (!id) {
+        // first visitor creates the cloud store from local
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var remote = await getBlob(id);
+      if (!remote) {
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var meta = {};
+      try { meta = JSON.parse(localStorage.getItem(META_KEY)||'{}'); } catch(e){}
+      var remoteAt = Number(remote.updatedAt||0);
+      var localAt = Number(meta.updatedAt||0);
+      if (forceApply || remoteAt >= localAt) {
+        writeLocalBundle(remote);
+        // re-render dynamic bits if available
+        if (typeof window.__siteEditRestore === 'function') try { window.__siteEditRestore(); } catch(e){}
+        // soft reload products grid if function exists
+        if (document.getElementById('products-grid')) {
+          // trigger storage event consumers
+          try { window.dispatchEvent(new Event('testing-cloud-pull')); } catch(e){}
+        }
+      }
+    } catch(e) {
+      console.warn('cloud pull failed', e);
+    }
+    pulling = false;
+  }
+
+  function showSync(msg, ok){
+    var el = document.getElementById('cloud-sync-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'cloud-sync-toast';
+      el.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:100002;padding:8px 12px;border-radius:10px;font-size:12px;opacity:0;transition:opacity .25s;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    el.style.background = ok ? '#0a2a24' : '#2a0a0a';
+    el.style.border = ok ? '1px solid #00e5cc55' : '1px solid #ff4d4d55';
+    el.style.color = ok ? '#00e5cc' : '#ff4d4d';
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(window.__cloudToastTimer);
+    window.__cloudToastTimer = setTimeout(function(){ el.style.opacity = '0'; }, 1800);
+  }
+
+  // Patch localStorage setItem for our keys to auto-push
+  try {
+    var _set = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function(k, v){
+      _set(k, v);
+      if (applying) return;
+      if (!k) return;
+      if (k.indexOf('testing_') === 0 && k !== CACHE_KEY && k !== META_KEY && k !== BLOB_KEY && k !== 'testing_orders_wiped_v2') {
+        schedulePush();
+      }
+    };
+  } catch(e){}
+
+  // Expose API
+  window.TestingCloud = {
+    push: pushNow,
+    pull: pullNow,
+    getBlobId: getBlobId,
+    setBlobId: setBlobId,
+    shareUrl: function(){
+      var id = getBlobId();
+      if (!id) return location.href;
+      var u = new URL(location.href);
+      u.searchParams.set('cloud', id);
+      return u.toString();
+    }
+  };
+
+  // Admin: show cloud id + force sync buttons when panel opens
+  document.addEventListener('DOMContentLoaded', function(){
+    // inject share helpers into admin if present later
+  });
+
+  // Boot: pull then periodic pull
+  pullNow(true).then(function(){
+    // After first pull, if products empty seed still works via existing scripts
+  });
+  setInterval(function(){ pullNow(false); }, PULL_MS);
+
+  // Save site edits button should push
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    if (!t) return;
+    if (t.id === 'edit-save-btn' || (t.closest && t.closest('#edit-save-btn'))) {
+      setTimeout(function(){ pushNow(); }, 100);
+    }
+  });
+})();
+</script>
+
+<main class="auth-container">
+  <div class="auth-card">
+    <a class="lobster-icon" href="#" aria-label="TESTING"><svg class="icon" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M60 10 C30 10 15 35 15 55 C15 75 30 95 45 100 L45 110 L55 110 L55 100 C55 100 60 102 65 100 L65 110 L75 110 L75 100 C90 95 105 75 105 55 C105 35 90 10 60 10Z" fill="url(#lobster-grad)"/><path d="M20 45 C5 40 0 50 5 60 C10 70 20 65 25 55 C28 48 25 45 20 45Z" fill="url(#lobster-grad)"/><path d="M100 45 C115 40 120 50 115 60 C110 70 100 65 95 55 C92 48 95 45 100 45Z" fill="url(#lobster-grad)"/><circle cx="45" cy="35" r="6" fill="#050810"/><circle cx="75" cy="35" r="6" fill="#050810"/><circle cx="46" cy="34" r="2" fill="#00e5cc"/><circle cx="76" cy="34" r="2" fill="#00e5cc"/><defs><linearGradient id="lobster-grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ff4d4d"/><stop offset="100%" stop-color="#991b1b"/></linearGradient></defs></svg></a>
+    <h1 class="auth-title">Welcome back</h1>
+    <p class="auth-subtitle">Sign in to your TESTING account</p>
+    <div class="auth-success" role="status"></div>
+    <div class="auth-error" role="alert"></div>
+    <form class="auth-form" id="login-form">
+      <div class="field">
+        <label class="label" for="email">Email</label>
+        <input class="input" type="email" id="email" name="email" required placeholder="you@example.com" autocomplete="username">
+      </div>
+      <div class="field">
+        <label class="label" for="password">Password</label>
+        <div class="password-wrap">
+          <input class="input-2" type="password" id="password" name="password" required placeholder="Your password" autocomplete="current-password">
+          <button class="password-toggle" type="button" aria-label="Show password">
+            <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="remember-row">
+        <input class="input-3" type="checkbox" id="remember" name="remember">
+        <label class="label-2" for="remember">Remember me</label>
+      </div>
+      <button class="auth-btn" type="submit">
+        <span class="btn-text">Sign in</span>
+        <svg class="btn-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+      </button>
+      <div class="auth-links">
+        <a class="link" href="signup.html">Create Account</a>
+      </div>
+    </form>
+  </div>
+</main>
+<style>
+@font-face { font-family: "Clash Display"; src: url("https://smscode.gg/fonts/ClashDisplay-Semibold.woff2") format("woff2"), url("https://smscode.gg/fonts/ClashDisplay-Semibold.woff") format("woff"); font-weight: 600; font-display: swap; font-style: normal; }
+@font-face { font-family: "Clash Display"; src: url("https://smscode.gg/fonts/ClashDisplay-Bold.woff2") format("woff2"), url("https://smscode.gg/fonts/ClashDisplay-Bold.woff") format("woff"); font-weight: 700; font-display: swap; font-style: normal; }
+@font-face { font-family: Satoshi; src: url("https://smscode.gg/fonts/Satoshi-Regular.woff2") format("woff2"), url("https://smscode.gg/fonts/Satoshi-Regular.woff") format("woff"); font-weight: 400; font-display: swap; font-style: normal; }
+
+.auth-container, .auth-container * { box-sizing: border-box; margin: 0; padding: 0; }
+.auth-container a { color: inherit; text-decoration: inherit; }
+.auth-container button, .auth-container input { font: inherit; color: inherit; background: transparent; border-radius: 0; }
+
+.auth-container {
+  padding: 24px; display: flex; min-height: 100vh; justify-content: center; align-items: center;
+  font-family: Satoshi, "Noto Sans", system-ui, sans-serif; font-size: 16px; line-height: 1.6;
+  color: #f0f4ff; background-color: #050810;
+}
+.auth-container .auth-card {
+  padding: 36px 24px; border-radius: 20px; border: 1px solid #8892b026;
+  animation: fadeInUp 0.6s ease-out; width: 100%; max-width: 420px; text-align: center;
+  background-color: #0a0f1ab3; backdrop-filter: blur(16px);
+}
+.auth-container .lobster-icon {
+  margin: 0 auto 24px; display: block; width: 60px; height: 60px;
+  transition: transform 0.3s ease; animation: float 4s ease-in-out infinite;
+}
+.auth-container .icon {
+  width: 100%; height: 100%; filter: drop-shadow(#ff4d4d66 0 0 16px); transition: filter 0.3s ease;
+}
+.auth-container .auth-title {
+  margin-bottom: 6px; font-family: "Clash Display", system-ui, sans-serif; font-size: 24px; font-weight: 700;
+}
+.auth-container .auth-subtitle { margin-bottom: 32px; font-size: 15.2px; color: #8892b0; }
+.auth-container .auth-success, .auth-container .auth-error {
+  padding: 0 16px; overflow: hidden; border-radius: 10px; max-height: 0; font-size: 14.4px;
+  opacity: 0; transition: all 0.25s ease; margin-bottom: 0;
+}
+.auth-container .auth-success { border: 1px solid #00e5cc33; color: #00e5cc; background: #00e5cc14; }
+.auth-container .auth-error { border: 1px solid #ff4d4d33; color: #ff4d4d; background: #ff4d4d14; }
+.auth-container .auth-success.show, .auth-container .auth-error.show {
+  max-height: 60px; opacity: 1; padding: 12px 16px; margin-bottom: 16px;
+}
+.auth-container .auth-form { gap: 20px; display: flex; flex-direction: column; text-align: left; }
+.auth-container .field { gap: 6px; display: flex; flex-direction: column; }
+.auth-container .label {
+  font-family: "Clash Display", system-ui, sans-serif; font-size: 13.6px; font-weight: 600;
+  letter-spacing: 0.02em; color: #8892b0;
+}
+.auth-container .input, .auth-container .input-2 {
+  padding: 14px 16px; border-radius: 12px; border: 1px solid #8892b026;
+  width: 100%; font-size: 15.2px; background: #05081099; color: #f0f4ff; transition: 0.25s;
+}
+.auth-container .input-2 { padding-right: 48px; }
+.auth-container .password-wrap { position: relative; }
+.auth-container .password-toggle {
+  position: absolute; top: 50%; right: 12px; transform: translateY(-50%);
+  display: flex; color: #5a6480; cursor: pointer; background: none; border: none; padding: 4px;
+}
+.auth-container .eye-off { width: 18px; height: 18px; }
+.auth-container .remember-row { gap: 10px; display: flex; align-items: center; cursor: pointer; margin-top: -4px; }
+.auth-container .input-3 {
+  width: 18px; height: 18px; border-radius: 5px; border: 1px solid #8892b026;
+  background: #05081099; cursor: pointer; appearance: none; flex-shrink: 0;
+}
+.auth-container .input-3:checked {
+  background: #ff4d4d; border-color: #ff4d4d;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-size: 12px; background-repeat: no-repeat; background-position: center;
+}
+.auth-container .label-2 { font-size: 13.6px; color: #8892b0; cursor: pointer; }
+.auth-container .auth-btn {
+  padding: 15px 28px; border-radius: 12px; gap: 10px; display: flex; justify-content: center; align-items: center;
+  font-family: "Clash Display", system-ui, sans-serif; font-weight: 600; color: #fff; border: none; cursor: pointer;
+  background-image: linear-gradient(135deg, #ff4d4d 0%, #991b1b 100%);
+  box-shadow: 0 4px 20px #ff4d4d40; transition: 0.25s; margin-top: 4px;
+}
+.auth-container .btn-arrow { width: 18px; height: 18px; transition: transform 0.2s; }
+.auth-container .oauth-divider { margin-block: 4px; gap: 16px; display: flex; align-items: center; }
+.auth-container .oauth-divider::before, .auth-container .oauth-divider::after {
+  content: ""; height: 1px; flex-grow: 1; background: #8892b026;
+}
+.auth-container .span { font-size: 13.6px; letter-spacing: 0.05em; text-transform: uppercase; color: #5a6480; }
+.auth-container .google-btn {
+  padding: 13px 28px; border-radius: 12px; border: 1px solid #8892b026; gap: 10px;
+  display: flex; width: 100%; justify-content: center; align-items: center;
+  font-family: "Clash Display", system-ui, sans-serif; font-size: 15.2px; font-weight: 600;
+  background: #ffffff0d; color: #f0f4ff; cursor: pointer; transition: 0.25s;
+}
+.auth-container .auth-links {
+  gap: 8px; display: flex; margin-top: 8px; justify-content: center; font-size: 14.4px; color: #8892b0;
+}
+.auth-container .link { color: #00e5cc; transition: color 0.2s; }
+@media (min-width: 481px) {
+  .auth-container .auth-card { padding: 48px 40px; }
+  .auth-container .lobster-icon { width: 72px; height: 72px; }
+  .auth-container .auth-title { font-size: 28.8px; }
+}
+.auth-container .input::placeholder, .auth-container .input-2::placeholder { color: #5a6480; }
+.auth-container .lobster-icon:hover { animation: none; transform: scale(1.1); }
+.auth-container .lobster-icon:hover .icon { filter: drop-shadow(#00e5cc99 0 0 30px); }
+.auth-container .input:focus, .auth-container .input-2:focus {
+  border-color: #ff4d4d; box-shadow: 0 0 0 3px #ff4d4d26; outline: none;
+}
+.auth-container .password-toggle:hover { color: #8892b0; }
+.auth-container .auth-btn:hover { box-shadow: 0 8px 30px #ff4d4d59; transform: translateY(-2px); }
+.auth-container .auth-btn:hover .btn-arrow { transform: translateX(3px); }
+.auth-container .google-btn:hover { border-color: #8892b04d; background: #ffffff1a; transform: translateY(-1px); }
+.auth-container .link:hover { color: #f0f4ff; }
+.auth-container .remember-row:hover .label-2 { color: #f0f4ff; }
+@keyframes fadeInUp { 0% { opacity: 0; transform: translateY(20px); } 100% { opacity: 1; transform: translateY(0); } }
+@keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+</style>
+<script>
+(function() {
+  // Already logged in? Go straight to dashboard
+  try {
+    var existing = JSON.parse(localStorage.getItem('testing_auth') || 'null');
+    if (existing && existing.loggedIn) {
+      window.location.href = 'smscode-dashboard.html';
+    }
+  } catch(e) {}
+
+  // Seed default ADMIN account if no users exist
+  function getUsers() {
+    try {
+      var u = JSON.parse(localStorage.getItem('testing_users') || '[]');
+      if (!Array.isArray(u)) u = [];
+      // Always ensure ADMIN exists
+      var hasAdmin = u.some(function(x) { return x.email.toLowerCase() === 'admin@gmail.com'; });
+      if (!hasAdmin) {
+        u.push({ email: 'ADMIN@gmail.com', password: 'ADMIN5522', name: 'ADMIN', referralCode: 'Z5QMCZ2F2S54', userId: 'Z5QMCZ2F2S54', balance: 0, rate: 3.0, role: 'admin' });
+        localStorage.setItem('testing_users', JSON.stringify(u));
+      }
+      return u;
+    } catch(e) {
+      var def = [{ email: 'ADMIN@gmail.com', password: 'ADMIN5522', name: 'ADMIN', referralCode: 'Z5QMCZ2F2S54', userId: 'Z5QMCZ2F2S54', balance: 0, rate: 3.0, role: 'admin' }];
+      localStorage.setItem('testing_users', JSON.stringify(def));
+      return def;
+    }
+  }
+
+  // Password toggle
+  var toggle = document.querySelector('.password-toggle');
+  var pwd = document.getElementById('password');
+  if (toggle && pwd) {
+    toggle.addEventListener('click', function() {
+      pwd.type = pwd.type === 'password' ? 'text' : 'password';
+    });
+  }
+
+  function showError(msg) {
+    var el = document.querySelector('.auth-error');
+    var ok = document.querySelector('.auth-success');
+    ok.classList.remove('show');
+    el.textContent = msg;
+    el.classList.add('show');
+  }
+  function showSuccess(msg) {
+    var el = document.querySelector('.auth-success');
+    var err = document.querySelector('.auth-error');
+    err.classList.remove('show');
+    el.textContent = msg;
+    el.classList.add('show');
+  }
+
+  document.getElementById('login-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    var email = document.getElementById('email').value.trim();
+    var password = document.getElementById('password').value;
+
+    if (!email || !password) {
+      showError('Please fill in all fields.');
+      return;
+    }
+
+    var users = getUsers();
+    // Exact match on email (case-insensitive) AND exact password
+    var user = users.find(function(u) {
+      return u.email.toLowerCase() === email.toLowerCase() && u.password === password;
+    });
+
+    var btn = this.querySelector('.auth-btn');
+    var original = btn.innerHTML;
+    btn.innerHTML = '<span class="btn-text">Signing in...</span>';
+    btn.disabled = true;
+
+    setTimeout(function() {
+      if (!user) {
+        // Check if email exists but password wrong
+        var emailExists = users.some(function(u) { return u.email.toLowerCase() === email.toLowerCase(); });
+        if (emailExists) {
+          showError('Incorrect password.');
+        } else {
+          showError('No account found with this email.');
+        }
+        btn.innerHTML = original;
+        btn.disabled = false;
+        return;
+      }
+
+      // Success
+      localStorage.setItem('testing_auth', JSON.stringify({
+        email: user.email,
+        name: user.name || user.email.split('@')[0],
+        referralCode: user.referralCode || '',
+        userId: user.userId || user.referralCode || '',
+        role: user.role || 'client',
+        loggedIn: true
+      }));
+      showSuccess('Signed in successfully! Redirecting...');
+      setTimeout(function() {
+        window.location.href = 'smscode-dashboard.html';
+      }, 700);
+    }, 500);
+  });
+})();
+</script>
+
+
+<!-- ADMIN PANEL -->
+<style>
+  #admin-fab {
+    position: fixed; bottom: 22px; right: 22px; z-index: 99999;
+    width: 48px; height: 48px; border-radius: 14px;
+    border: 1px solid #ff4d4d55;
+    background: linear-gradient(135deg, #ff4d4d 0%, #991b1b 100%);
+    color: #fff; font-family: "Clash Display", system-ui, sans-serif;
+    font-weight: 700; font-size: 13px; letter-spacing: 0.04em;
+    cursor: pointer; box-shadow: 0 8px 28px #ff4d4d55, 0 2px 8px #0008;
+    display: flex; align-items: center; justify-content: center;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  #admin-fab:hover { transform: translateY(-3px) scale(1.04); box-shadow: 0 12px 36px #ff4d4d77; }
+  #admin-overlay {
+    position: fixed; inset: 0; z-index: 100000;
+    background: #050810cc; backdrop-filter: blur(8px);
+    display: none; align-items: flex-start; justify-content: center;
+    padding: 24px 16px; overflow-y: auto;
+  }
+  #admin-overlay.open { display: flex; }
+  #admin-panel {
+    width: 100%; max-width: 420px;
+    background: #0a0f1af2; border: 1px solid #ff4d4d40; border-radius: 18px;
+    box-shadow: 0 20px 60px #000a, 0 0 40px #ff4d4d22;
+    animation: adminIn 0.25s ease-out; margin: auto;
+  }
+  @keyframes adminIn {
+    from { opacity: 0; transform: translateY(16px) scale(0.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  #admin-panel .ap-header {
+    padding: 18px 20px; border-bottom: 1px solid #8892b026;
+    display: flex; align-items: center; justify-content: space-between;
+    background: linear-gradient(90deg, #ff4d4d18, transparent);
+    position: sticky; top: 0; z-index: 2;
+  }
+  #admin-panel .ap-title {
+    font-family: "Clash Display", system-ui, sans-serif; font-weight: 700;
+    font-size: 16px; color: #ff4d4d; display: flex; align-items: center; gap: 8px;
+  }
+  #admin-panel .ap-close {
+    background: #8892b014; border: 1px solid #8892b026; color: #8892b0;
+    width: 32px; height: 32px; border-radius: 8px; cursor: pointer; font-size: 18px;
+    display: flex; align-items: center; justify-content: center; transition: 0.2s;
+  }
+  #admin-panel .ap-close:hover { background: #ff4d4d22; color: #ff4d4d; border-color: #ff4d4d44; }
+  #admin-panel .ap-body { padding: 20px; }
+  #admin-panel .ap-label {
+    font-family: "Clash Display", system-ui, sans-serif; font-size: 12px; font-weight: 600;
+    color: #8892b0; letter-spacing: 0.04em; margin-bottom: 8px; display: block;
+  }
+  #admin-panel .ap-input {
+    width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #8892b026;
+    background: #05081099; color: #f0f4ff; font-size: 14px; margin-bottom: 14px;
+    outline: none; transition: 0.2s; box-sizing: border-box;
+  }
+  #admin-panel .ap-input:focus { border-color: #ff4d4d; box-shadow: 0 0 0 3px #ff4d4d26; }
+  #admin-panel .ap-btn {
+    width: 100%; padding: 13px; border-radius: 10px; border: none;
+    background: linear-gradient(135deg, #ff4d4d, #991b1b); color: #fff;
+    font-family: "Clash Display", system-ui, sans-serif; font-weight: 600; font-size: 14px;
+    cursor: pointer; box-shadow: 0 4px 18px #ff4d4d40; transition: 0.2s;
+  }
+  #admin-panel .ap-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 24px #ff4d4d55; }
+  #admin-panel .ap-error { color: #ff4d4d; font-size: 13px; margin-bottom: 12px; display: none; }
+  #admin-panel .ap-error.show { display: block; }
+  #admin-panel .ap-section {
+    margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #8892b014;
+  }
+  #admin-panel .ap-section:last-child { border-bottom: none; margin-bottom: 0; }
+  #admin-panel .ap-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px;
+  }
+  #admin-panel .ap-row label { font-size: 13.5px; color: #f0f4ff; }
+  #admin-panel .ap-toggle {
+    width: 44px; height: 24px; border-radius: 12px; background: #8892b033;
+    border: none; cursor: pointer; position: relative; transition: 0.2s; flex-shrink: 0;
+  }
+  #admin-panel .ap-toggle.on { background: #ff4d4d; }
+  #admin-panel .ap-toggle::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px;
+    border-radius: 50%; background: #fff; transition: 0.2s;
+  }
+  #admin-panel .ap-toggle.on::after { left: 23px; }
+  #admin-panel .ap-small { font-size: 12px; color: #5a6480; margin-top: 4px; }
+  #admin-gate { display: block; }
+  #admin-controls { display: none; }
+  #admin-controls.open { display: block; }
+
+  #admin-toast {
+    position: fixed; bottom: 84px; right: 22px; z-index: 100001;
+    min-width: 220px; max-width: 320px;
+    padding: 12px 16px; border-radius: 12px;
+    font-family: Satoshi, system-ui, sans-serif; font-size: 13.5px;
+    box-shadow: 0 8px 28px #0008; opacity: 0; transform: translateY(8px);
+    transition: opacity 0.25s, transform 0.25s; pointer-events: none;
+  }
+  #admin-toast.show { opacity: 1; transform: translateY(0); }
+  #admin-toast.ok { background: #0a2a24; border: 1px solid #00e5cc55; color: #00e5cc; }
+  #admin-toast.err { background: #2a0a0a; border: 1px solid #ff4d4d55; color: #ff4d4d; }
+  body.site-edit-mode [contenteditable="true"] {
+    outline: 1px dashed #ff4d4d66 !important;
+    min-width: 20px;
+  }
+</style>
+
+<div id="admin-toast"></div>
+<button id="admin-fab" type="button" title="Admin" aria-label="Admin panel">ADM</button>
+
+<div id="admin-overlay">
+  <div id="admin-panel">
+    <div class="ap-header">
+      <div class="ap-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        Admin Panel
+      </div>
+      <button class="ap-close" type="button" id="admin-close" aria-label="Close">×</button>
+    </div>
+    <div class="ap-body">
+      <div id="admin-gate">
+        <label class="ap-label">ADMIN PASSWORD</label>
+        <input class="ap-input" type="password" id="admin-pass" placeholder="Enter admin password" autocomplete="off">
+        <div class="ap-error" id="admin-err">Wrong password.</div>
+        <button class="ap-btn" type="button" id="admin-unlock">Unlock Panel</button>
+        <p class="ap-small" style="margin-top:12px;text-align:center;">Protected controls for live site settings</p>
+      </div>
+
+      <div id="admin-controls">
+        <div class="ap-section">
+          <label class="ap-label">LIVE STATUS</label>
+          <div class="ap-row"><label>Site Online</label><button class="ap-toggle on" type="button" data-key="site_online"></button></div>
+          <div class="ap-row"><label>Maintenance Mode</label><button class="ap-toggle" type="button" data-key="maintenance"></button></div>
+          <div class="ap-row"><label>Site Edit Mode</label><button class="ap-toggle" type="button" data-key="edit_mode"></button></div>
+          <div class="ap-row"><label>New Signups</label><button class="ap-toggle on" type="button" data-key="signups"></button></div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">DEPOSITS</label>
+          <div class="ap-row"><label>Crypto Deposits</label><button class="ap-toggle on" type="button" data-key="crypto_deposits"></button></div>
+          <div class="ap-row">
+            <label>Min Deposit (USDT)</label>
+            <input class="ap-input" style="width:90px;margin:0;padding:8px 10px;" type="number" id="admin-min-dep" value="1" min="0" step="0.1">
+          </div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">ORDERS</label>
+          <div class="ap-row"><label>Orders Enabled</label><button class="ap-toggle on" type="button" data-key="orders_enabled"></button></div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">ANNOUNCEMENT</label>
+          <input class="ap-input" type="text" id="admin-announce" placeholder="Banner message (optional)">
+          <div class="ap-row"><label>Show Banner</label><button class="ap-toggle" type="button" data-key="show_banner"></button></div>
+        </div>
+
+        
+        
+        <div class="ap-section">
+          <label class="ap-label">CLOUD SYNC (ALL USERS)</label>
+          <p class="ap-small" style="margin-bottom:8px;">Products, edits, orders, users sync for everyone on the link.</p>
+          <input class="ap-input" type="text" id="admin-cloud-id" placeholder="Cloud ID" readonly style="font-family:monospace;font-size:12px;">
+          <div style="display:flex;gap:8px;">
+            <button class="ap-btn" type="button" id="admin-cloud-push" style="flex:1;background:linear-gradient(135deg,#00e5cc,#0a8f80);">Force Sync</button>
+            <button class="ap-btn" type="button" id="admin-cloud-copy" style="flex:1;">Copy Share Link</button>
+          </div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">MANAGE USER BY CODE</label>
+          <input class="ap-input" type="text" id="admin-user-code" placeholder="Enter code e.g. Z5QMCZ2F2S54" style="text-transform:uppercase;font-family:monospace;">
+          <button class="ap-btn" type="button" id="admin-lookup" style="margin-bottom:12px;background:linear-gradient(135deg,#00e5cc,#0a8f80);box-shadow:0 4px 18px #00e5cc40;">Lookup User</button>
+          <p class="ap-small" id="admin-user-msg" style="text-align:center;display:none;margin-bottom:10px;"></p>
+
+          <div id="admin-user-info" style="display:none;background:#05081099;border:1px solid #8892b026;border-radius:12px;padding:14px;">
+            <div style="font-size:12px;color:#00e5cc;margin-bottom:12px;font-family:Clash Display,system-ui,sans-serif;font-weight:600;">USER LOADED — EDIT FIELDS BELOW</div>
+
+            
+            <label class="ap-label">ROLE</label>
+            <div class="ap-row" style="margin-bottom:14px;">
+              <label style="font-size:13.5px;color:#f0f4ff;">Seller account</label>
+              <button class="ap-toggle" type="button" id="au-seller-toggle" title="Toggle seller"></button>
+            </div>
+            <label class="ap-label">USER ID (permanent)</label>
+            <input class="ap-input" type="text" id="au-userid-input" placeholder="User ID" readonly style="opacity:0.85;font-family:monospace;">
+
+            
+            <label class="ap-label">PHONE NUMBER</label>
+            <input class="ap-input" type="text" id="au-phone-input" placeholder="Phone">
+
+            <label class="ap-label">RENAME (NAME)</label>
+            <input class="ap-input" type="text" id="au-name-input" placeholder="Name">
+
+            <label class="ap-label">EDIT EMAIL</label>
+            <input class="ap-input" type="email" id="au-email-input" placeholder="Email">
+
+            <label class="ap-label">EDIT PASSWORD</label>
+            <input class="ap-input" type="text" id="au-pass-input" placeholder="Password">
+
+            <label class="ap-label">EDIT REFERRAL CODE</label>
+            <input class="ap-input" type="text" id="au-code-input" placeholder="Code" style="text-transform:uppercase;font-family:monospace;">
+
+            <label class="ap-label">EDIT BALANCE ($)</label>
+            <input class="ap-input" type="number" id="au-balance-input" placeholder="0" step="0.01">
+
+            <label class="ap-label">EDIT RATE (%)</label>
+            <input class="ap-input" type="number" id="au-rate-input" placeholder="3" step="0.1">
+
+            <button class="ap-btn" type="button" id="admin-save-user" style="margin-bottom:8px;background:linear-gradient(135deg,#00e5cc,#0a8f80);box-shadow:0 4px 18px #00e5cc40;">SAVE / RENAME / EDIT</button>
+            <button class="ap-btn" type="button" id="admin-delete-user" style="background:linear-gradient(135deg,#ff4d4d,#661111);">DELETE USER</button>
+          </div>
+        </div>
+
+        <button class="ap-btn ap-save" type="button" id="admin-save">Save Live Settings</button>
+        <p class="ap-small" id="admin-saved" style="text-align:center;color:#00e5cc;display:none;margin-top:10px;">Settings saved.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var ADMIN_PASSWORD = 'Jamra456';
+  var STORAGE_KEY = 'testing_admin_settings';
+  var currentUserIdx = -1;
+
+  function $(id){ return document.getElementById(id); }
+  function getSettings(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||'{}'); } catch(e){ return {}; } }
+  function setSettings(s){ localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
+  function getUsers(){
+    try {
+      var u = JSON.parse(localStorage.getItem('testing_users')||'[]');
+      if (!Array.isArray(u)) u = [];
+      var hasAdmin = u.some(function(x){ return (x.email||'').toLowerCase()==='admin@gmail.com'; });
+      if (!hasAdmin) {
+        u.push({ email:'ADMIN@gmail.com', password:'ADMIN5522', name:'ADMIN', referralCode:'Z5QMCZ2F2S54', userId:'Z5QMCZ2F2S54', balance:0, rate:3, role:'admin' });
+        localStorage.setItem('testing_users', JSON.stringify(u));
+      }
+      return u;
+    } catch(e) {
+      var d=[{ email:'ADMIN@gmail.com', password:'ADMIN5522', name:'ADMIN', referralCode:'Z5QMCZ2F2S54', userId:'Z5QMCZ2F2S54', balance:0, rate:3, role:'admin' }];
+      localStorage.setItem('testing_users', JSON.stringify(d));
+      return d;
+    }
+  }
+  function saveUsers(u){ localStorage.setItem('testing_users', JSON.stringify(u)); }
+
+  var fab = $('admin-fab');
+  var overlay = $('admin-overlay');
+  var closeBtn = $('admin-close');
+  var unlockBtn = $('admin-unlock');
+  var passInput = $('admin-pass');
+  var errEl = $('admin-err');
+  var gate = $('admin-gate');
+  var controls = $('admin-controls');
+  var saveBtn = $('admin-save');
+  var savedMsg = $('admin-saved');
+
+  function openPanel(){
+    overlay.classList.add('open');
+    gate.style.display = 'block';
+    controls.classList.remove('open');
+    passInput.value = '';
+    errEl.classList.remove('show');
+    setTimeout(function(){ passInput.focus(); }, 80);
+  }
+  function closePanel(){ overlay.classList.remove('open'); }
+
+  if (fab) fab.onclick = openPanel;
+  if (closeBtn) closeBtn.onclick = closePanel;
+  if (overlay) overlay.addEventListener('click', function(e){ if (e.target === overlay) closePanel(); });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closePanel(); });
+
+  function tryUnlock(){
+    if (passInput.value === ADMIN_PASSWORD) {
+      errEl.classList.remove('show');
+      gate.style.display = 'none';
+      controls.classList.add('open');
+      loadSettingsUI();
+      if (typeof adminToast==='function') adminToast('Admin unlocked.', true);
+    } else {
+      errEl.classList.add('show');
+      passInput.value = '';
+      passInput.focus();
+      if (typeof adminToast==='function') adminToast('Wrong admin password.', false);
+    }
+  }
+  if (unlockBtn) unlockBtn.onclick = tryUnlock;
+  if (passInput) passInput.addEventListener('keydown', function(e){ if (e.key==='Enter') tryUnlock(); });
+
+  // Toggles
+  document.querySelectorAll('#admin-panel .ap-toggle').forEach(function(btn){
+    btn.onclick = function(){ this.classList.toggle('on'); };
+  });
+
+  function loadSettingsUI(){
+    var s = getSettings();
+    document.querySelectorAll('#admin-panel .ap-toggle').forEach(function(btn){
+      var key = btn.getAttribute('data-key');
+      if (key && s.hasOwnProperty(key)) {
+        if (s[key]) btn.classList.add('on'); else btn.classList.remove('on');
+      }
+    });
+    if (s.min_deposit != null && $('admin-min-dep')) $('admin-min-dep').value = s.min_deposit;
+    if (s.announcement && $('admin-announce')) $('admin-announce').value = s.announcement;
+  }
+
+  if (saveBtn) saveBtn.onclick = function(){
+    var s = getSettings();
+    document.querySelectorAll('#admin-panel .ap-toggle').forEach(function(btn){
+      var key = btn.getAttribute('data-key');
+      if (key) s[key] = btn.classList.contains('on');
+    });
+    s.min_deposit = parseFloat(($('admin-min-dep')||{}).value) || 1;
+    s.announcement = (($('admin-announce')||{}).value || '').trim();
+    setSettings(s);
+    if (savedMsg) {
+      savedMsg.style.display = 'block';
+      setTimeout(function(){ savedMsg.style.display = 'none'; }, 1800);
+    }
+    applyLive(s);
+    if (typeof adminToast==='function') adminToast('Live settings saved.', true);
+  };
+
+  // User lookup
+  var lookupBtn = $('admin-lookup');
+  var userInfo = $('admin-user-info');
+  var userMsg = $('admin-user-msg');
+  function umsg(t, ok){
+    if (!userMsg) return;
+    userMsg.style.display = 'block';
+    userMsg.style.color = ok ? '#00e5cc' : '#ff4d4d';
+    userMsg.textContent = t;
+    setTimeout(function(){ userMsg.style.display = 'none'; }, 2200);
+  }
+
+  if (lookupBtn) lookupBtn.onclick = function(){
+    var code = (($('admin-user-code')||{}).value || '').trim().toUpperCase();
+    if (!code) { umsg('Enter a referral code.', false); return; }
+    var users = getUsers();
+    var idx = users.findIndex(function(u){ return (u.referralCode||'').toUpperCase() === code; });
+    if (idx < 0) {
+      currentUserIdx = -1;
+      if (userInfo) userInfo.style.display = 'none';
+      umsg('No user found with that code.', false);
+      return;
+    }
+    currentUserIdx = idx;
+    var u = users[idx];
+    $('au-name-input').value = u.name || '';
+    $('au-email-input').value = u.email || '';
+    $('au-pass-input').value = u.password || '';
+    $('au-code-input').value = u.referralCode || '';
+    $('au-balance-input').value = Number(u.balance || 0);
+    $('au-rate-input').value = Number(u.rate != null ? u.rate : 3);
+    userInfo.style.display = 'block';
+    umsg('User loaded.', true);
+  };
+
+  var saveUserBtn = $('admin-save-user');
+  if (saveUserBtn) saveUserBtn.onclick = function(){
+    if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+    var users = getUsers();
+    var u = users[currentUserIdx];
+    var newCode = (($('au-code-input')||{}).value || '').trim().toUpperCase();
+    if (newCode && users.some(function(x,i){ return i!==currentUserIdx && (x.referralCode||'').toUpperCase()===newCode; })) {
+      umsg('That referral code is already used.', false); return;
+    }
+    u.name = (($('au-name-input')||{}).value || '').trim() || u.name;
+    u.email = (($('au-email-input')||{}).value || '').trim() || u.email;
+    u.password = ($('au-pass-input')||{}).value || u.password;
+    u.referralCode = newCode || u.referralCode;
+    u.balance = parseFloat(($('au-balance-input')||{}).value) || 0;
+    u.rate = parseFloat(($('au-rate-input')||{}).value);
+    if (isNaN(u.rate)) u.rate = 3;
+    users[currentUserIdx] = u;
+    saveUsers(users);
+    try {
+      var auth = JSON.parse(localStorage.getItem('testing_auth')||'null');
+      if (auth && auth.email && auth.email.toLowerCase() === (u.email||'').toLowerCase()) {
+        auth.name = u.name; auth.email = u.email; auth.referralCode = u.referralCode;
+        localStorage.setItem('testing_auth', JSON.stringify(auth));
+      }
+    } catch(e){}
+    umsg('User saved.', true);
+  };
+
+  var delUserBtn = $('admin-delete-user');
+  if (delUserBtn) delUserBtn.onclick = function(){
+    if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+    if (!confirm('Delete this user permanently?')) return;
+    var users = getUsers();
+    users.splice(currentUserIdx, 1);
+    saveUsers(users);
+    currentUserIdx = -1;
+    if (userInfo) userInfo.style.display = 'none';
+    if ($('admin-user-code')) $('admin-user-code').value = '';
+    umsg('User deleted.', true);
+  };
+
+  
+  // ---- USER MANAGE BY CODE (robust) ----
+  var currentUserIdx = -1;
+  function getUsersAll(){
+    var u = [];
+    try { u = JSON.parse(localStorage.getItem('testing_users')||'[]'); } catch(e){ u=[]; }
+    if (!Array.isArray(u)) u = [];
+    var ai = u.findIndex(function(x){ return (x.email||'').toLowerCase()==='admin@gmail.com'; });
+    if (ai < 0) {
+      u.push({ email:'ADMIN@gmail.com', password:'ADMIN5522', name:'ADMIN', referralCode:'Z5QMCZ2F2S54', userId:'Z5QMCZ2F2S54', balance:0, rate:3, role:'admin' });
+    } else {
+      if (!u[ai].referralCode) u[ai].referralCode = 'Z5QMCZ2F2S54';
+    }
+    var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    u.forEach(function(user){
+      if (!user.referralCode) {
+        var c=''; for (var i=0;i<12;i++) c += chars.charAt(Math.floor(Math.random()*chars.length));
+        user.referralCode = c;
+      }
+      if (user.balance == null) user.balance = 0;
+      if (user.rate == null) user.rate = 3;
+    });
+    localStorage.setItem('testing_users', JSON.stringify(u));
+    return u;
+  }
+  function umsg(t, ok){
+    var el = document.getElementById('admin-user-msg');
+    if (el) { el.style.display = 'block'; el.style.color = ok ? '#00e5cc' : '#ff4d4d'; el.textContent = t; }
+    if (typeof adminToast==='function') adminToast(t, !!ok);
+  }
+
+  var lookupBtn = document.getElementById('admin-lookup');
+  var userInfo = document.getElementById('admin-user-info');
+  var saveUserBtn = document.getElementById('admin-save-user');
+  var delUserBtn = document.getElementById('admin-delete-user');
+
+  var sellerToggle=document.getElementById('au-seller-toggle');
+  if(sellerToggle){ sellerToggle.onclick=function(){ this.classList.toggle('on'); }; } // seller toggle click
+  if (lookupBtn) {
+    lookupBtn.onclick = function(){
+      var codeEl = document.getElementById('admin-user-code');
+      var code = (codeEl && codeEl.value ? codeEl.value : '').trim().toUpperCase();
+      if (!code) { umsg('Enter a referral code.', false); return; }
+      var users = getUsersAll();
+      var idx = -1;
+      for (var i=0;i<users.length;i++){
+        if ((users[i].referralCode||'').toUpperCase() === code) { idx = i; break; }
+      }
+      if (idx < 0) {
+        currentUserIdx = -1;
+        if (userInfo) userInfo.style.display = 'none';
+        umsg('No user found for code: ' + code, false);
+        return;
+      }
+      currentUserIdx = idx;
+      var u = users[idx];
+      document.getElementById('au-name-input').value = u.name || '';
+      var ph=document.getElementById('au-phone-input'); if(ph) ph.value = u.phone || '';
+      var st=document.getElementById('au-seller-toggle'); if(st){ if(u.role==='seller'||u.role==='admin') st.classList.add('on'); else st.classList.remove('on'); }
+      var uidEl=document.getElementById('au-userid-input'); if(uidEl) uidEl.value = u.userId || u.referralCode || '';
+      document.getElementById('au-email-input').value = u.email || '';
+      document.getElementById('au-pass-input').value = u.password || '';
+      document.getElementById('au-code-input').value = u.referralCode || '';
+      document.getElementById('au-balance-input').value = Number(u.balance||0);
+      document.getElementById('au-rate-input').value = Number(u.rate!=null?u.rate:3);
+      if (userInfo) userInfo.style.display = 'block';
+      umsg('Loaded: ' + (u.name||u.email) + ' (' + u.referralCode + ')', true);
+    };
+  }
+
+  if (saveUserBtn) {
+    saveUserBtn.onclick = function(){
+      if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+      var users = getUsersAll();
+      if (currentUserIdx >= users.length) { umsg('User no longer exists.', false); return; }
+      var u = users[currentUserIdx];
+      var newCode = (document.getElementById('au-code-input').value||'').trim().toUpperCase();
+      for (var i=0;i<users.length;i++){
+        if (i!==currentUserIdx && (users[i].referralCode||'').toUpperCase()===newCode) {
+          umsg('Code already used by another user.', false); return;
+        }
+      }
+      var st=document.getElementById('au-seller-toggle');
+      if(st){ u.role = st.classList.contains('on') ? (u.role==='admin'?'admin':'seller') : (u.role==='admin'?'admin':'client'); }
+      var phEl=document.getElementById('au-phone-input'); if(phEl) u.phone = (phEl.value||'').trim();
+      u.name = (document.getElementById('au-name-input').value||'').trim() || u.name;
+      u.email = (document.getElementById('au-email-input').value||'').trim() || u.email;
+      u.password = document.getElementById('au-pass-input').value || u.password;
+      u.referralCode = newCode || u.referralCode;
+      u.balance = parseFloat(document.getElementById('au-balance-input').value);
+      if (isNaN(u.balance)) u.balance = 0;
+      u.balance = Math.round(u.balance * 100) / 100;
+      u.rate = parseFloat(document.getElementById('au-rate-input').value);
+      if (isNaN(u.rate)) u.rate = 3;
+      users[currentUserIdx] = u;
+      localStorage.setItem('testing_users', JSON.stringify(users));
+      try {
+        var auth = JSON.parse(localStorage.getItem('testing_auth')||'null');
+        if (auth && auth.email && auth.email.toLowerCase()===(u.email||'').toLowerCase()) {
+          auth.name=u.name; auth.email=u.email; auth.referralCode=u.referralCode; auth.balance=u.balance;
+          localStorage.setItem('testing_auth', JSON.stringify(auth));
+        }
+      } catch(e){}
+      umsg('Saved: ' + u.name + ' / ' + u.referralCode, true);
+    };
+  }
+
+  if (delUserBtn) {
+    delUserBtn.onclick = function(){
+      if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+      if (!confirm('DELETE this user permanently?')) return;
+      var users = getUsersAll();
+      var removed = users.splice(currentUserIdx,1)[0];
+      localStorage.setItem('testing_users', JSON.stringify(users));
+      currentUserIdx = -1;
+      if (userInfo) userInfo.style.display = 'none';
+      var codeEl = document.getElementById('admin-user-code');
+      if (codeEl) codeEl.value = '';
+      umsg('Deleted: ' + ((removed&&removed.email)||'user'), true);
+    };
+  }
+
+  
+  function adminToast(msg, ok) {
+    var t = document.getElementById('admin-toast');
+    if (!t) return;
+    t.textContent = msg;
+    t.className = (ok ? 'ok' : 'err') + ' show';
+    clearTimeout(window.__adminToastTimer);
+    window.__adminToastTimer = setTimeout(function(){ t.classList.remove('show'); }, 2200);
+  }
+
+  function applyEditMode(on) {
+    document.body.classList.toggle('site-edit-mode', !!on);
+
+    // Force save bar + non-editable controls
+    var bar=document.getElementById('edit-save-bar');
+    if(bar){
+      bar.style.display = on ? 'flex' : 'none';
+      bar.setAttribute('contenteditable','false');
+      bar.querySelectorAll('*').forEach(function(n){ n.setAttribute('contenteditable','false'); });
+    }
+    if (on && window.__siteEditMark) window.__siteEditMark();
+
+    var bar=document.getElementById('edit-save-bar');
+    if(bar) bar.style.display = on ? 'flex' : 'none';
+    var selectors = 'h1,h2,h3,h4,p,span,label,a,button,.page-title,.auth-title,.kpi-label,.kpi-value,.section-title,.welcome-name,.user-email';
+    document.querySelectorAll(selectors).forEach(function(el) {
+      // skip admin UI itself
+      if (el.closest('#admin-panel') || el.closest('#admin-fab') || el.closest('#admin-overlay') || el.closest('#admin-toast') || el.closest('#edit-save-bar') || el.id==='edit-save-btn') return;
+      if (on) {
+        if (!el.hasAttribute('data-was-ce')) {
+          el.setAttribute('data-was-ce', el.getAttribute('contenteditable') || '');
+        }
+        el.setAttribute('contenteditable', 'true');
+      } else {
+        if (el.hasAttribute('data-was-ce')) {
+          var prev = el.getAttribute('data-was-ce');
+          if (prev) el.setAttribute('contenteditable', prev);
+          else el.removeAttribute('contenteditable');
+          el.removeAttribute('data-was-ce');
+        } else {
+          el.removeAttribute('contenteditable');
+        }
+      }
+    });
+  }
+
+  
+  // Cloud sync admin controls
+  (function(){
+    function fillCloudId(){
+      var el = document.getElementById('admin-cloud-id');
+      if (!el || !window.TestingCloud) return;
+      el.value = TestingCloud.getBlobId() || '(creating...)';
+    }
+    setInterval(fillCloudId, 2000);
+    fillCloudId();
+    var pushBtn = document.getElementById('admin-cloud-push');
+    if (pushBtn) pushBtn.onclick = function(){
+      if (!window.TestingCloud) return;
+      TestingCloud.push().then(function(){ fillCloudId(); if (typeof adminToast==='function') adminToast('Force synced', true); });
+    };
+    var copyBtn = document.getElementById('admin-cloud-copy');
+    if (copyBtn) copyBtn.onclick = function(){
+      if (!window.TestingCloud) return;
+      var url = TestingCloud.shareUrl();
+      navigator.clipboard.writeText(url).then(function(){
+        if (typeof adminToast==='function') adminToast('Share link copied', true);
+        else alert('Copied: '+url);
+      });
+    };
+  })();
+
+  function applyLive(s){
+    if (typeof applyEditMode==='function') applyEditMode(!!s.edit_mode);
+    var existing = document.getElementById('live-maintenance');
+    if (s.maintenance) {
+      if (!existing) {
+        var d = document.createElement('div');
+        d.id = 'live-maintenance';
+        d.style.cssText = 'position:fixed;inset:0;z-index:99990;background:#050810ee;display:flex;align-items:center;justify-content:center;color:#f0f4ff;font-family:Clash Display,system-ui,sans-serif;text-align:center;padding:24px;';
+        d.innerHTML = '<div><div style="font-size:28px;font-weight:700;margin-bottom:8px;color:#ff4d4d;">Maintenance</div><div style="color:#8892b0;">We will be back shortly.</div></div>';
+        document.body.appendChild(d);
+      }
+    } else if (existing) existing.remove();
+
+    var banner = document.getElementById('live-banner');
+    if (s.show_banner && s.announcement) {
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'live-banner';
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99980;background:linear-gradient(90deg,#ff4d4d,#991b1b);color:#fff;text-align:center;padding:10px 16px;font-size:13.5px;font-family:Satoshi,system-ui,sans-serif;';
+        document.body.appendChild(banner);
+        document.body.style.paddingTop = '40px';
+      }
+      banner.textContent = s.announcement;
+    } else if (banner) {
+      banner.remove();
+      document.body.style.paddingTop = '';
+    }
+  }
+
+  applyLive(getSettings());
+})();
+</script>
+
+
+<div id="edit-save-bar" contenteditable="false" style="display:none;position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:99998;background:#0a0f1af2;border:1px solid #ff4d4d55;border-radius:14px;padding:12px 18px;box-shadow:0 12px 40px #000a,0 0 24px #ff4d4d33;display:none;align-items:center;gap:14px;font-family:Satoshi,system-ui,sans-serif;">
+  <span contenteditable="false" style="color:#ff4d4d;font-family:Clash Display,system-ui,sans-serif;font-weight:700;font-size:13px;letter-spacing:0.04em;">EDITING</span>
+  <span contenteditable="false" style="color:#8892b0;font-size:13px;">Edit the site, then save for all users</span>
+  <button id="edit-save-btn" type="button" contenteditable="false" style="padding:10px 16px;border:none;border-radius:10px;background:linear-gradient(135deg,#ff4d4d,#991b1b);color:#fff;font-family:Clash Display,system-ui,sans-serif;font-weight:600;font-size:13px;cursor:pointer;box-shadow:0 4px 16px #ff4d4d44;">Save Changes</button>
+</div>
+
+
+
+<script>
+(function(){
+  var bar = document.getElementById('edit-save-bar');
+  var btn = document.getElementById('edit-save-btn');
+  var GLOBAL_KEY = 'testing_site_edits_v1';
+
+  function isAdminUI(el) {
+    if (!el || !el.closest) return true;
+    return !!(el.closest('#admin-panel') || el.closest('#admin-overlay') || el.closest('#admin-fab') || el.closest('#admin-toast') || el.closest('#edit-save-bar') || el.closest('#live-banner') || el.closest('#live-maintenance'));
+  }
+
+  function editableTargets() {
+    return Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3,h4,p,span,a,label,button,div.page-title,div.auth-title')).filter(function(el){
+      if (isAdminUI(el)) return false;
+      if (el.querySelector && el.querySelector('h1,h2,h3,h4,p,span,a,label,button,input,svg,img')) {
+        // skip containers that only wrap other elements (prefer leaf-ish text nodes)
+        var text = (el.textContent || '').trim();
+        if (!text) return false;
+        // allow if element has direct meaningful text
+      }
+      // skip pure icon buttons without text
+      var t = (el.textContent || '').trim();
+      if (!t) return false;
+      return true;
+    });
+  }
+
+  function markTargets() {
+    editableTargets().forEach(function(el, i) {
+      if (!el.getAttribute('data-site-edit-id')) {
+        var id = (el.id ? el.id + '_' : '') + (el.className ? String(el.className).toString().replace(/\s+/g,'_').slice(0,40) : el.tagName) + '_' + i;
+        el.setAttribute('data-site-edit-id', id);
+      }
+    });
+  }
+
+  function saveAllEdits() {
+    markTargets();
+    var data = {};
+    document.querySelectorAll('[data-site-edit-id]').forEach(function(el) {
+      if (isAdminUI(el)) return;
+      data[el.getAttribute('data-site-edit-id')] = el.innerHTML;
+    });
+    localStorage.setItem(GLOBAL_KEY, JSON.stringify(data));
+    if (typeof adminToast === 'function') adminToast('All site changes saved. They will stay after refresh.', true);
+    else alert('All site changes saved.');
+  }
+
+  function restoreAllEdits() {
+    try {
+      var data = JSON.parse(localStorage.getItem(GLOBAL_KEY) || '{}');
+      if (!data || typeof data !== 'object') return;
+      markTargets();
+      document.querySelectorAll('[data-site-edit-id]').forEach(function(el) {
+        var id = el.getAttribute('data-site-edit-id');
+        if (data[id] != null) el.innerHTML = data[id];
+      });
+    } catch(e) {}
+  }
+
+  // Restore on every page load
+  restoreAllEdits();
+
+  if (btn) {
+    // Ensure button itself is never editable
+    btn.setAttribute('contenteditable', 'false');
+    btn.onclick = function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      saveAllEdits();
+    };
+  }
+  if (bar) {
+    bar.setAttribute('contenteditable', 'false');
+    bar.querySelectorAll('*').forEach(function(n){ n.setAttribute('contenteditable', 'false'); });
+  }
+
+  // Show/hide bar with edit mode
+  function syncBar() {
+    if (!bar) return;
+    bar.style.display = document.body.classList.contains('site-edit-mode') ? 'flex' : 'none';
+  }
+  var obs = new MutationObserver(syncBar);
+  obs.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  syncBar();
+
+  // When edit mode turns on, mark targets and enable contenteditable except admin/save UI
+  var oldApply = null;
+  // Patch applyEditMode if available later
+  document.addEventListener('click', function(){}, true);
+
+  // Re-define helper used by admin applyEditMode if present
+  window.__siteEditMark = markTargets;
+  window.__siteEditSave = saveAllEdits;
+  window.__siteEditRestore = restoreAllEdits;
+})();
+</script>
+
+
+<script>
+(function(){
+  // ===== Unique permanent user id + roles + orders =====
+  function uid() {
+    var s = '';
+    var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    for (var i=0;i<12;i++) s += chars.charAt(Math.floor(Math.random()*chars.length));
+    return s;
+  }
+  function getUsers() {
+    var u=[]; try{u=JSON.parse(localStorage.getItem('testing_users')||'[]');}catch(e){u=[];}
+    if(!Array.isArray(u)) u=[];
+    var changed=false;
+    // ensure admin
+    var ai=u.findIndex(function(x){return (x.email||'').toLowerCase()==='admin@gmail.com';});
+    if(ai<0){ u.push({email:'ADMIN@gmail.com',password:'ADMIN5522',name:'ADMIN',referralCode:'Z5QMCZ2F2S54',userId:'Z5QMCZ2F2S54',balance:0,rate:3,role:'admin'}); changed=true; }
+    u.forEach(function(user){
+      if(!user.referralCode){ user.referralCode=uid(); changed=true; }
+      if(!user.userId){ user.userId=user.referralCode; changed=true; } // permanent unique id = same as code style, never changes once set
+      if(user.balance==null){ user.balance=0; changed=true; }
+      if(user.rate==null){ user.rate=3; changed=true; }
+      if(!user.role){ user.role=(user.email||'').toLowerCase()==='admin@gmail.com'?'admin':'client'; changed=true; }
+    });
+    if(changed) localStorage.setItem('testing_users', JSON.stringify(u));
+    return u;
+  }
+  function saveUsers(u){ localStorage.setItem('testing_users', JSON.stringify(u)); }
+  function getAuth(){ try{return JSON.parse(localStorage.getItem('testing_auth')||'null');}catch(e){return null;} }
+  function currentUser(){
+    var auth=getAuth(); if(!auth||!auth.email) return null;
+    var users=getUsers();
+    return users.find(function(x){return (x.email||'').toLowerCase()===auth.email.toLowerCase();})||null;
+  }
+  function getOrders(){ try{var o=JSON.parse(localStorage.getItem('testing_orders')||'[]'); return Array.isArray(o)?o:[];}catch(e){return [];} }
+  function saveOrders(o){ localStorage.setItem('testing_orders', JSON.stringify(o)); }
+  function newOrderId(){ return 'ORD-'+Date.now().toString(36).toUpperCase()+'-'+Math.floor(Math.random()*9999); }
+
+  window.TestingApp = {
+    getUsers:getUsers, saveUsers:saveUsers, currentUser:currentUser, getAuth:getAuth,
+    getOrders:getOrders, saveOrders:saveOrders, newOrderId:newOrderId, uid:uid
+  };
+
+  // Keep auth.userId in session
+  var cu = currentUser();
+  if (cu) {
+    var auth = getAuth()||{};
+    auth.userId = cu.userId;
+    auth.referralCode = cu.referralCode;
+    auth.role = cu.role;
+    auth.name = cu.name;
+    localStorage.setItem('testing_auth', JSON.stringify(auth));
+  }
+})();
+</script>
+
+
+<script>
+(function(){
+  try {
+    if (localStorage.getItem('testing_orders_wiped_v2') !== '1' && !localStorage.getItem('testing_cloud_blob_id')) {
+      localStorage.setItem('testing_orders', '[]');
+      localStorage.setItem('testing_orders_wiped_v2', '1');
+    }
+  } catch(e) {}
+})();
+</script>
+
+</body>
+</html>

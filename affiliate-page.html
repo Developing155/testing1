@@ -1,0 +1,3843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TESTING - Affiliate</title>
+  <style>
+    :root {
+      --bg-deep: #050810;
+      --coral-bright: #ff4d4d;
+      --coral-dark: #991b1b;
+      --cyan-bright: #00e5cc;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background-color: #050810 !important;
+      color: #f0f4ff;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+  </style>
+</head>
+<body>
+
+<script>
+(function(){
+  // ===== SHARED CLOUD STORE (all users on the link) =====
+  var BLOB_KEY = 'testing_cloud_blob_id';
+  var CACHE_KEY = 'testing_cloud_cache';
+  var META_KEY = 'testing_cloud_meta';
+  var API = 'https://jsonblob.com/api/jsonBlob';
+  var SAVE_DEBOUNCE_MS = 800;
+  var PULL_MS = 4000;
+  var saveTimer = null;
+  var pulling = false;
+  var applying = false;
+
+  function defaultData(){
+    return {
+      users: [],
+      products: [],
+      orders: [],
+      transactions: [],
+      siteEdits: {},
+      adminSettings: {},
+      updatedAt: Date.now()
+    };
+  }
+
+  function readLocalBundle(){
+    var data = defaultData();
+    try { data.users = JSON.parse(localStorage.getItem('testing_users')||'[]')||[]; } catch(e){}
+    try { data.products = JSON.parse(localStorage.getItem('testing_products')||'[]')||[]; } catch(e){}
+    try { data.orders = JSON.parse(localStorage.getItem('testing_orders')||'[]')||[]; } catch(e){}
+    try { data.transactions = JSON.parse(localStorage.getItem('testing_transactions')||'[]')||[]; } catch(e){}
+    try { data.adminSettings = JSON.parse(localStorage.getItem('testing_admin_settings')||'{}')||{}; } catch(e){}
+    // collect all site edit keys
+    data.siteEdits = {};
+    try {
+      for (var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if (k && k.indexOf('testing_site_edits')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+        if (k && k.indexOf('testing_page_edits_')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+      }
+    } catch(e){}
+    data.updatedAt = Date.now();
+    return data;
+  }
+
+  function writeLocalBundle(data, skipAuth){
+    if (!data || typeof data !== 'object') return;
+    applying = true;
+    try {
+      if (Array.isArray(data.users)) localStorage.setItem('testing_users', JSON.stringify(data.users));
+      if (Array.isArray(data.products)) localStorage.setItem('testing_products', JSON.stringify(data.products));
+      if (Array.isArray(data.orders)) localStorage.setItem('testing_orders', JSON.stringify(data.orders));
+      if (Array.isArray(data.transactions)) localStorage.setItem('testing_transactions', JSON.stringify(data.transactions));
+      if (data.adminSettings) localStorage.setItem('testing_admin_settings', JSON.stringify(data.adminSettings));
+      if (data.siteEdits && typeof data.siteEdits === 'object') {
+        Object.keys(data.siteEdits).forEach(function(k){
+          try { localStorage.setItem(k, JSON.stringify(data.siteEdits[k])); } catch(e){}
+        });
+      }
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      localStorage.setItem(META_KEY, JSON.stringify({ updatedAt: data.updatedAt||Date.now() }));
+    } catch(e){}
+    applying = false;
+  }
+
+  function getBlobId(){ return localStorage.getItem(BLOB_KEY) || ''; }
+  function setBlobId(id){ if (id) localStorage.setItem(BLOB_KEY, id); }
+
+  async function createBlob(data){
+    var res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('create failed '+res.status);
+    // Location header: https://jsonblob.com/api/jsonBlob/{id}
+    var loc = res.headers.get('Location') || res.headers.get('location') || '';
+    var id = loc.split('/').pop();
+    if (!id) {
+      try { var j = await res.json(); id = j.id || j.blobId; } catch(e){}
+    }
+    if (!id) throw new Error('no blob id');
+    setBlobId(id);
+    return id;
+  }
+
+  async function putBlob(id, data){
+    var res = await fetch(API + '/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (res.status === 404) {
+      // recreate
+      return createBlob(data);
+    }
+    if (!res.ok) throw new Error('put failed '+res.status);
+    return id;
+  }
+
+  async function getBlob(id){
+    var res = await fetch(API + '/' + id, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error('get failed '+res.status);
+    return await res.json();
+  }
+
+  async function pushNow(){
+    if (applying) return;
+    var data = readLocalBundle();
+    try {
+      var id = getBlobId();
+      if (!id) id = await createBlob(data);
+      else id = await putBlob(id, data);
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      showSync('Synced to cloud', true);
+      return id;
+    } catch(e) {
+      console.warn('cloud push failed', e);
+      showSync('Cloud sync failed (will retry)', false);
+    }
+  }
+
+  function schedulePush(){
+    if (applying) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function(){ pushNow(); }, SAVE_DEBOUNCE_MS);
+  }
+
+  async function pullNow(forceApply){
+    if (pulling) return;
+    pulling = true;
+    try {
+      var id = getBlobId();
+      // If no id yet, try from URL param shared by admin
+      if (!id) {
+        var params = new URLSearchParams(location.search);
+        var qid = params.get('cloud') || params.get('sync');
+        if (qid) { setBlobId(qid); id = qid; }
+      }
+      if (!id) {
+        // first visitor creates the cloud store from local
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var remote = await getBlob(id);
+      if (!remote) {
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var meta = {};
+      try { meta = JSON.parse(localStorage.getItem(META_KEY)||'{}'); } catch(e){}
+      var remoteAt = Number(remote.updatedAt||0);
+      var localAt = Number(meta.updatedAt||0);
+      if (forceApply || remoteAt >= localAt) {
+        writeLocalBundle(remote);
+        // re-render dynamic bits if available
+        if (typeof window.__siteEditRestore === 'function') try { window.__siteEditRestore(); } catch(e){}
+        // soft reload products grid if function exists
+        if (document.getElementById('products-grid')) {
+          // trigger storage event consumers
+          try { window.dispatchEvent(new Event('testing-cloud-pull')); } catch(e){}
+        }
+      }
+    } catch(e) {
+      console.warn('cloud pull failed', e);
+    }
+    pulling = false;
+  }
+
+  function showSync(msg, ok){
+    var el = document.getElementById('cloud-sync-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'cloud-sync-toast';
+      el.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:100002;padding:8px 12px;border-radius:10px;font-size:12px;opacity:0;transition:opacity .25s;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    el.style.background = ok ? '#0a2a24' : '#2a0a0a';
+    el.style.border = ok ? '1px solid #00e5cc55' : '1px solid #ff4d4d55';
+    el.style.color = ok ? '#00e5cc' : '#ff4d4d';
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(window.__cloudToastTimer);
+    window.__cloudToastTimer = setTimeout(function(){ el.style.opacity = '0'; }, 1800);
+  }
+
+  // Patch localStorage setItem for our keys to auto-push
+  try {
+    var _set = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function(k, v){
+      _set(k, v);
+      if (applying) return;
+      if (!k) return;
+      if (k.indexOf('testing_') === 0 && k !== CACHE_KEY && k !== META_KEY && k !== BLOB_KEY && k !== 'testing_orders_wiped_v2') {
+        schedulePush();
+      }
+    };
+  } catch(e){}
+
+  // Expose API
+  window.TestingCloud = {
+    push: pushNow,
+    pull: pullNow,
+    getBlobId: getBlobId,
+    setBlobId: setBlobId,
+    shareUrl: function(){
+      var id = getBlobId();
+      if (!id) return location.href;
+      var u = new URL(location.href);
+      u.searchParams.set('cloud', id);
+      return u.toString();
+    }
+  };
+
+  // Admin: show cloud id + force sync buttons when panel opens
+  document.addEventListener('DOMContentLoaded', function(){
+    // inject share helpers into admin if present later
+  });
+
+  // Boot: pull then periodic pull
+  pullNow(true).then(function(){
+    // After first pull, if products empty seed still works via existing scripts
+  });
+  setInterval(function(){ pullNow(false); }, PULL_MS);
+
+  // Save site edits button should push
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    if (!t) return;
+    if (t.id === 'edit-save-btn' || (t.closest && t.closest('#edit-save-btn'))) {
+      setTimeout(function(){ pushNow(); }, 100);
+    }
+  });
+})();
+</script>
+
+<!-- Exported with Design Toolkit from https://smscode.gg/affiliate — HTML + CSS. -->
+<div class="app-shell">
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="header-logo" href="smscode-dashboard.html" aria-label="TESTING dashboard">
+        <svg class="logo-icon" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M60 10 C30 10 15 35 15 55 C15 75 30 95 45 100 L45 110 L55 110 L55 100 C55 100 60 102 65 100 L65 110 L75 110 L75 100 C90 95 105 75 105 55 C105 35 90 10 60 10Z" fill="url(#lg-app)"/><path d="M20 45 C5 40 0 50 5 60 C10 70 20 65 25 55 C28 48 25 45 20 45Z" fill="url(#lg-app)"/><path d="M100 45 C115 40 120 50 115 60 C110 70 100 65 95 55 C92 48 95 45 100 45Z" fill="url(#lg-app)"/><circle cx="45" cy="35" r="6" fill="var(--bg-deep)"/><circle cx="75" cy="35" r="6" fill="var(--bg-deep)"/><circle cx="46" cy="34" r="2" fill="var(--cyan-bright)"/><circle cx="76" cy="34" r="2" fill="var(--cyan-bright)"/><defs><linearGradient id="lg-app" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--coral-bright)"/><stop offset="100%" stop-color="var(--coral-dark)"/></linearGradient></defs></svg>
+        <span class="logo-text">TESTING</span>
+      </a>
+      <nav class="header-nav" aria-label="Main navigation">
+        <a class="nav-link" href="smscode-dashboard.html">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="3" width="7" height="7" opacity="1"/><rect x="14" y="3" width="7" height="7" opacity="1"/><rect x="14" y="14" width="7" height="7" opacity="1"/><rect x="3" y="14" width="7" height="7" opacity="1"/></svg>
+          Dashboard
+        </a>
+        <a class="nav-link" href="orders-page.html">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" opacity="1"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1" opacity="1"/></svg>
+          Orders
+        </a>
+        <a class="nav-link" href="deposit-page.html">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><line x1="12" y1="1" x2="12" y2="23" opacity="1"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" opacity="1"/></svg>
+          Deposit
+        </a>
+        <a class="nav-link" href="transactions-page.html">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" opacity="1"/><polyline points="14 2 14 8 20 8" opacity="1"/><line x1="16" y1="13" x2="8" y2="13" opacity="1"/><line x1="16" y1="17" x2="8" y2="17" opacity="1"/></svg>
+          Transactions
+        </a>
+        <a class="nav-link-2" href="affiliate-page.html" aria-current="page">
+          <svg class="lucide" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m11 17 2 2a1 1 0 1 0 3-3"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4"/><path d="m21 3 1 11h-2"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3"/><path d="M3 4h8"/></svg>
+          Affiliate
+        </a>
+        </nav>
+      <div class="header-actions">
+        <div class="notif-wrap">
+          <button class="notif-bell" aria-label="Notifications" aria-expanded="false" aria-haspopup="true">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          </button>
+        </div>
+        <div class="notif-wrap">
+          <button class="user-menu-trigger" aria-expanded="false" aria-haspopup="true" aria-label="User menu">
+            <span class="user-avatar">A</span>
+            <span class="user-email">ADMIN@gmail.com</span>
+            <svg class="user-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+          <div class="user-dropdown" role="menu">
+            <div class="dropdown-header">
+              <span class="dropdown-email">ADMIN@gmail.com</span>
+              <span class="dropdown-role">Member</span>
+            </div>
+            <div class="dropdown-divider"></div>
+            <a class="dropdown-item" href="#" role="menuitem">
+              <svg class="icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" opacity="1"/><circle cx="12" cy="7" r="4" opacity="1"/></svg>
+              Account
+            </a>
+            <div class="dropdown-divider"></div>
+            <button class="dropdown-item-2" role="menuitem">
+              <svg class="icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" opacity="1"/><polyline points="16 17 21 12 16 7" opacity="1"/><line x1="21" y1="12" x2="9" y2="12" opacity="1"/></svg>
+              Log out
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="mobile-controls">
+        <button class="notif-bell-2" aria-label="Notifications" aria-expanded="false" aria-haspopup="true">
+          <svg class="icon-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        </button>
+        <button class="mobile-toggle" aria-expanded="false" aria-controls="mobile-nav" aria-label="Open navigation menu">
+          <span class="hamburger-line"></span>
+          <span class="hamburger-line"></span>
+          <span class="hamburger-line"></span>
+        </button>
+      </div>
+    </div>
+    <div class="notif-panel" role="dialog" aria-label="Notifications">
+      <div class="notif-header">
+        <h3 class="notif-title">Notifications</h3>
+        <button class="notif-mark-all">Mark all read</button>
+      </div>
+      <div class="notif-list">
+        <div class="notif-empty">
+          No notifications yet
+        </div>
+      </div>
+    </div>
+    <div class="mobile-nav" aria-label="Mobile navigation" aria-hidden="true" id="mobile-nav">
+      <nav class="mobile-nav-links">
+        <a class="mobile-nav-link" href="smscode-dashboard.html">
+          <svg class="nav-icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="3" width="7" height="7" opacity="1"/><rect x="14" y="3" width="7" height="7" opacity="1"/><rect x="14" y="14" width="7" height="7" opacity="1"/><rect x="3" y="14" width="7" height="7" opacity="1"/></svg>
+          Dashboard
+        </a>
+        <a class="mobile-nav-link" href="orders-page.html">
+          <svg class="nav-icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" opacity="1"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1" opacity="1"/></svg>
+          Orders
+        </a>
+        <a class="mobile-nav-link" href="deposit-page.html">
+          <svg class="nav-icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><line x1="12" y1="1" x2="12" y2="23" opacity="1"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" opacity="1"/></svg>
+          Deposit
+        </a>
+        <a class="mobile-nav-link" href="transactions-page.html">
+          <svg class="nav-icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" opacity="1"/><polyline points="14 2 14 8 20 8" opacity="1"/><line x1="16" y1="13" x2="8" y2="13" opacity="1"/><line x1="16" y1="17" x2="8" y2="17" opacity="1"/></svg>
+          Transactions
+        </a>
+        <a class="mobile-nav-link-2" href="affiliate-page.html" aria-current="page">
+          <svg class="nav-icon-2" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m11 17 2 2a1 1 0 1 0 3-3" opacity="1"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4" opacity="1"/><path d="m21 3 1 11h-2" opacity="1"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3" opacity="1"/><path d="M3 4h8" opacity="1"/></svg>
+          Affiliate
+        </a>
+        </nav>
+      <div class="mobile-divider"></div>
+      <div class="mobile-nav-links">
+        <div class="mobile-user-info">
+          <span class="user-avatar-2">A</span>
+          <span class="mobile-user-email">ADMIN@gmail.com</span>
+        </div>
+        <a class="mobile-nav-link" href="#">
+          <svg class="nav-icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" opacity="1"/><circle cx="12" cy="7" r="4" opacity="1"/></svg>
+          Account
+        </a>
+        <button class="mobile-nav-link-3">
+          <svg class="nav-icon-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" opacity="1"/><polyline points="16 17 21 12 16 7" opacity="1"/><line x1="21" y1="12" x2="9" y2="12" opacity="1"/></svg>
+          Log out
+        </button>
+      </div>
+    </div>
+  </header>
+  <main class="app-main">
+    <div class="affiliate-page">
+      <header class="page-header">
+        <div>
+          <p class="page-kicker">Partner earnings</p>
+          <h1 class="title">Affiliate</h1>
+        </div>
+        <span class="account-state">Pending terms</span>
+      </header>
+      <section class="state-band" aria-live="polite">
+        <div class="state-icon" aria-hidden="true">
+          <svg class="lucide-2" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+        </div>
+        <div>
+          <h2 class="title-2">Accept the current terms before sharing</h2>
+          <p class="text">Your code is reserved, but referral attribution and earnings are not active yet.</p>
+        </div>
+      </section>
+      <section class="terms-acceptance" aria-labelledby="affiliate-terms-title">
+        <div>
+          <p class="page-kicker">Current version: affiliate-terms-2026-07-25-v1</p>
+          <h2 class="title-3" id="affiliate-terms-title">Affiliate terms</h2>
+          <p class="text-2">Acceptance is required before referral sharing and money actions become available.</p>
+          <div class="terms-links">
+            <a class="link" href="#" target="_blank" rel="noopener noreferrer">
+              Read Terms
+              <svg class="lucide-3" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+            </a>
+            <a class="link" href="#" target="_blank" rel="noopener noreferrer">
+              Read Privacy Policy
+              <svg class="lucide-3" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+            </a>
+          </div>
+        </div>
+        <div class="terms-action">
+          <label class="attestation-row">
+            <input class="input" type="checkbox" value="on">
+            <span class="span">I confirm that I have read the current Terms and Privacy Policy.</span>
+          </label>
+          <button class="primary-btn" type="button" disabled>
+            <svg class="lucide-3" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+            <span class="span-2">Accept current terms</span>
+          </button>
+          <p class="form-message" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+      <section class="invite-band" aria-labelledby="invite-title">
+        <div class="section-heading">
+          <div>
+            <p class="page-kicker">Referral identity</p>
+            <h2 class="title-4" id="invite-title">Your code and link</h2>
+          </div>
+          <span class="policy-rate">3.00% rate</span>
+        </div>
+        <div class="invite-grid">
+          <div class="invite-value">
+            <span class="value-label">Code</span>
+            <code class="box-2">Z5QMCZ2F2S54</code>
+            <button class="icon-btn" type="button" title="Copy referral code" aria-label="Copy referral code">
+              <svg class="lucide-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+            </button>
+          </div>
+          <div class="invite-value-2">
+            <span class="value-label">Link</span>
+            <span class="referral-link">Unavailable until eligible</span>
+            <button class="icon-btn-2" type="button" disabled title="Copy referral link" aria-label="Copy referral link">
+              <svg class="lucide-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+            </button>
+            <button class="icon-btn-2" type="button" disabled title="Share referral link" aria-label="Share referral link">
+              <svg class="lucide-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>
+            </button>
+          </div>
+        </div>
+        <p class="action-status" role="status" aria-live="polite"></p>
+      </section>
+      <section class="terms-action" aria-labelledby="funnel-title">
+        <div class="section-heading-2">
+          <h2 class="title-4" id="funnel-title">Referral funnel</h2>
+        </div>
+        <div class="metric-strip">
+          <div class="metric-cell">
+            <span class="span-3">Clicks</span>
+            <strong class="strong">0</strong>
+          </div>
+          <div class="metric-cell-2">
+            <span class="span-3">Signups</span>
+            <strong class="strong">0</strong>
+          </div>
+          <div class="metric-cell-3">
+            <span class="span-3">First deposits</span>
+            <strong class="strong">0</strong>
+          </div>
+          <div class="metric-cell-4">
+            <span class="span-3">Qualified</span>
+            <strong class="strong">0</strong>
+          </div>
+        </div>
+      </section>
+      <section class="terms-action" aria-labelledby="earnings-title">
+        <div class="section-heading-2">
+          <h2 class="title-4" id="earnings-title">Earnings</h2>
+        </div>
+        <div class="metric-strip-2">
+          <div class="metric-cell-5">
+            <span class="span-3">Pending</span>
+            <strong class="strong-2"><span class="amt-prefix">≈</span>$0.00</strong>
+          </div>
+          <div class="metric-cell-6">
+            <span class="span-3">Available</span>
+            <strong class="positive"><span class="amt-prefix">≈</span>$0.00</strong>
+          </div>
+          <div class="metric-cell-7">
+            <span class="span-3">Reserved</span>
+            <strong class="strong-2"><span class="amt-prefix">≈</span>$0.00</strong>
+          </div>
+          <div class="metric-cell-2">
+            <span class="span-3">Paid</span>
+            <strong class="strong-2"><span class="amt-prefix">≈</span>$0.00</strong>
+          </div>
+          <div class="metric-cell-8">
+            <span class="span-3">Reversed</span>
+            <strong class="strong-2"><span class="amt-prefix">≈</span>$0.00</strong>
+          </div>
+          <div class="metric-cell-9">
+            <span class="span-3">Debt</span>
+            <strong class="strong-2"><span class="amt-prefix">≈</span>$0.00</strong>
+          </div>
+        </div>
+        <div class="monthly-budget">
+          <div class="budget-copy">
+            <span class="span-4">Monthly allocation</span>
+            <strong class="strong-3"><span class="amt-prefix">≈</span>$0.00 / <span class="amt-prefix">≈</span>$16.45</strong>
+          </div>
+          <div class="progress-track" role="progressbar" aria-label="Monthly allocation" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span class="span-5"></span>
+          </div>
+          <span class="remaining">≈ $16.45 remaining</span>
+        </div>
+      </section>
+      <section class="invite-band" aria-labelledby="money-actions-title">
+        <div class="section-heading">
+          <div>
+            <p class="page-kicker">Available earnings</p>
+            <h2 class="title-4" id="money-actions-title">Use your balance</h2>
+          </div>
+          <strong class="available-balance"><span class="amt-prefix">≈</span>$0.00</strong>
+        </div>
+        <div class="money-mode-tabs" role="tablist" aria-label="Method">
+          <button class="button" type="button" role="tab" aria-selected="true" disabled>
+            <svg class="lucide-5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/></svg>
+            TESTING
+          </button>
+          <button class="button-2" type="button" role="tab" aria-selected="false" disabled>
+            <svg class="lucide-5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/></svg>
+            DANA
+          </button>
+          <button class="button-2" type="button" role="tab" aria-selected="false" disabled>
+            <svg class="lucide-5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/></svg>
+            USDT (BEP20)
+          </button>
+        </div>
+        <form class="money-form">
+          <div class="money-form-grid">
+            <label class="field-group">
+              <span class="span-6">Amount (IDR)</span>
+              <input class="input-2" type="number" min="10000" max="0" step="1" required disabled>
+            </label>
+          </div>
+          <div class="money-policy" aria-live="polite">
+            <dl class="grid">
+              <div class="box-3">
+                <dt class="box-4">Minimum</dt>
+                <dd class="box-5">≈ $0.55</dd>
+              </div>
+              <div class="box-6">
+                <dt class="box-4">Fee</dt>
+                <dd class="box-5">No fee</dd>
+              </div>
+              <div class="box-7">
+                <dt class="box-4">Processing</dt>
+                <dd class="box-5">Immediate</dd>
+              </div>
+            </dl>
+            <p class="text-3">Conversion is final after your TESTING balance is credited.</p>
+          </div>
+          <p class="form-message-2" role="status" aria-live="polite"></p>
+          <div class="money-form-actions">
+            <button class="secondary-btn" type="button" disabled>
+              <svg class="lucide-5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+              Clear
+            </button>
+            <button class="primary-btn-2" type="submit" aria-label="Review TESTING conversion" disabled>
+              <span class="span-2">Review conversion</span>
+              <svg class="lucide-5" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </button>
+          </div>
+        </form>
+      </section>
+      <section class="terms-action" aria-labelledby="referrals-title">
+        <div class="section-heading">
+          <div>
+            <p class="page-kicker">Privacy-safe aliases</p>
+            <h2 class="title-4" id="referrals-title">Referrals</h2>
+          </div>
+          <span class="span-7">0 total</span>
+        </div>
+        <p class="empty-row">No referrals yet.</p>
+      </section>
+      <section class="terms-action" aria-labelledby="ledger-title">
+        <div class="section-heading">
+          <div>
+            <p class="page-kicker">Append-only record</p>
+            <h2 class="title-4" id="ledger-title">Ledger</h2>
+          </div>
+          <span class="span-7">0 entries</span>
+        </div>
+        <p class="empty-row">No ledger activity yet.</p>
+      </section>
+      <section class="terms-action" aria-labelledby="payouts-title">
+        <div class="section-heading">
+          <div>
+            <p class="page-kicker">Manual processing</p>
+            <h2 class="title-4" id="payouts-title">Payout history</h2>
+          </div>
+          <span class="span-7">0 requests</span>
+        </div>
+        <p class="empty-row">No payout history yet.</p>
+      </section>
+      <aside class="deletion-warning">
+        <svg class="lucide-6" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+        <p>Deleting your TESTING account freezes affiliate earnings and payout access. Existing liability records remain intact.</p>
+      </aside>
+    </div>
+  </main>
+  <footer class="app-footer">
+    <p class="text-4">© 2026 TESTING. All rights reserved.</p>
+  </footer>
+</div>
+
+<style>
+@font-face { font-family: "Clash Display"; src: url("https://smscode.gg/fonts/ClashDisplay-Semibold.woff2") format("woff2"), url("https://smscode.gg/fonts/ClashDisplay-Semibold.woff") format("woff"); font-weight: 600; font-display: swap; font-style: normal; }
+@font-face { font-family: "Clash Display"; src: url("https://smscode.gg/fonts/ClashDisplay-Bold.woff2") format("woff2"), url("https://smscode.gg/fonts/ClashDisplay-Bold.woff") format("woff"); font-weight: 700; font-display: swap; font-style: normal; }
+@font-face { font-family: Satoshi; src: url("https://smscode.gg/fonts/Satoshi-Regular.woff2") format("woff2"), url("https://smscode.gg/fonts/Satoshi-Regular.woff") format("woff"); font-weight: 400; font-display: swap; font-style: normal; }
+@font-face { font-family: Satoshi; src: url("https://smscode.gg/fonts/Satoshi-Medium.woff2") format("woff2"), url("https://smscode.gg/fonts/Satoshi-Medium.woff") format("woff"); font-weight: 500; font-display: swap; font-style: normal; }
+@font-face { font-family: Satoshi; src: url("https://smscode.gg/fonts/Satoshi-Bold.woff2") format("woff2"), url("https://smscode.gg/fonts/Satoshi-Bold.woff") format("woff"); font-weight: 700; font-display: swap; font-style: normal; }
+
+.app-shell, .app-shell *, .app-shell::before, .app-shell *::before, .app-shell::after, .app-shell *::after {box-sizing:border-box;margin:0;padding:0;border:0 solid}
+.app-shell:where(h1), .app-shell :where(h1), .app-shell:where(h2), .app-shell :where(h2), .app-shell:where(h3), .app-shell :where(h3), .app-shell:where(h4), .app-shell :where(h4), .app-shell:where(h5), .app-shell :where(h5), .app-shell:where(h6), .app-shell :where(h6) {font-size:inherit;font-weight:inherit}
+.app-shell:where(a), .app-shell :where(a) {color:inherit;text-decoration:inherit}
+.app-shell:where(b), .app-shell :where(b), .app-shell:where(strong), .app-shell :where(strong) {font-weight:bolder}
+.app-shell:where(ol), .app-shell :where(ol), .app-shell:where(ul), .app-shell :where(ul), .app-shell:where(menu), .app-shell :where(menu) {list-style:none}
+.app-shell:where(img), .app-shell :where(img), .app-shell:where(svg), .app-shell :where(svg), .app-shell:where(video), .app-shell :where(video), .app-shell:where(canvas), .app-shell :where(canvas), .app-shell:where(audio), .app-shell :where(audio), .app-shell:where(iframe), .app-shell :where(iframe) {display:block;vertical-align:middle}
+.app-shell:where(img), .app-shell :where(img), .app-shell:where(video), .app-shell :where(video) {max-width:100%;height:auto}
+.app-shell:where(button), .app-shell :where(button), .app-shell:where(input), .app-shell :where(input), .app-shell:where(select), .app-shell :where(select), .app-shell:where(optgroup), .app-shell :where(optgroup), .app-shell:where(textarea), .app-shell :where(textarea) {font:inherit;color:inherit;letter-spacing:inherit;background-color:transparent;border-radius:0}
+.app-shell:where(table), .app-shell :where(table) {border-collapse:collapse;text-indent:0;border-color:inherit}
+.app-shell:where([hidden]), .app-shell :where([hidden]) {display:none}
+
+.app-shell {
+  display: flex;
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  flex-direction: column;
+  font-family: Satoshi, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  color: #f0f4ff;
+  background-color: #050810;
+  caret-color: #f0f4ff;
+}
+
+.app-shell .app-header {
+  position: sticky;
+  top: 0px;
+  z-index: 50;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: #8892b026;
+  background-color: #050810e0;
+}
+
+.app-shell .header-inner {
+  margin-inline: auto;
+  padding-inline: 16px;
+  gap: 8px;
+  display: flex;
+  height: 64px;
+  max-width: 1440px;
+  align-items: center;
+}
+
+.app-shell .header-logo {
+  gap: 10px;
+  transition: opacity 0.2s ease;
+  display: flex;
+  margin-right: 4px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.app-shell .logo-icon {
+  width: 30px;
+  height: 30px;
+  filter: drop-shadow(#ff4d4d4d 0px 0px 8px);
+}
+
+.app-shell .logo-text {
+  display: none;
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 18.4px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.app-shell .header-nav {
+  padding: 4px;
+  border-radius: 10px;
+  gap: 3px;
+  display: none;
+  align-items: center;
+  background-color: #8892b00a;
+}
+
+.app-shell .nav-link {
+  padding: 8px;
+  border-radius: 8px;
+  gap: 5px;
+  display: flex;
+  align-items: center;
+  font-size: 14.08px;
+  font-weight: 500;
+  white-space: nowrap;
+  color: #8892b0;
+  transition-duration: 0.2s;
+  caret-color: #8892b0;
+}
+
+.app-shell .nav-icon {
+  transition: opacity 0.2s ease;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+
+.app-shell .nav-link-2 {
+  padding: 8px;
+  border-radius: 8px;
+  gap: 5px;
+  display: flex;
+  align-items: center;
+  font-size: 14.08px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: #ff4d4d;
+  background-color: #ff4d4d1a;
+  transition-duration: 0.2s;
+  caret-color: #ff4d4d;
+}
+
+.app-shell .lucide {
+  transition: opacity 0.2s ease;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.app-shell .header-actions {
+  gap: 4px;
+  display: none;
+  margin-left: auto;
+  align-items: center;
+}
+
+.app-shell .notif-wrap {
+  position: relative;
+}
+
+.app-shell .notif-bell {
+  border-radius: 10px;
+  border: 1px solid transparent;
+  display: flex;
+  position: relative;
+  width: 40px;
+  height: 40px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  transition-duration: 0.2s;
+  cursor: pointer;
+  caret-color: #8892b0;
+}
+
+.app-shell .icon {
+  width: 20px;
+  height: 20px;
+}
+
+.app-shell .user-menu-trigger {
+  padding: 6px 12px 6px 6px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  gap: 10px;
+  display: flex;
+  align-items: center;
+  font-size: 13.6px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  transition-duration: 0.2s;
+  cursor: pointer;
+  caret-color: #8892b0;
+}
+
+.app-shell .user-avatar {
+  border-radius: 8px;
+  display: flex;
+  width: 32px;
+  height: 32px;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 12.8px;
+  font-weight: 700;
+  line-height: 1;
+  color: #ffffff;
+  background-image: linear-gradient(135deg, #ff4d4d, #991b1b);
+  caret-color: #ffffff;
+}
+
+.app-shell .user-email {
+  overflow: hidden;
+  display: none;
+  max-width: 150px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.app-shell .user-chevron {
+  transition: transform 0.2s ease;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .user-dropdown {
+  padding: 6px;
+  border-radius: 12px;
+  border: 1px solid #8892b026;
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0px;
+  min-width: 220px;
+  visibility: hidden;
+  background-color: #0a0f1af2;
+  opacity: 0;
+  box-shadow: 0px 8px 32px 0px #00000066, 0px 0px 0px 1px #8892b00f;
+  transform: translateY(-4px) scale(0.98);
+  transition-duration: 0.15s;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.app-shell .dropdown-header {
+  padding: 10px 12px;
+  gap: 2px;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell .dropdown-email {
+  overflow: hidden;
+  display: block;
+  font-size: 13.6px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.app-shell .dropdown-role {
+  display: block;
+  font-size: 12px;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .dropdown-divider {
+  margin-block: 4px;
+  height: 1px;
+  background-color: #8892b026;
+}
+
+.app-shell .dropdown-item {
+  padding: 10px 12px;
+  border-radius: 8px;
+  gap: 10px;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  font-size: 13.6px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  transition-duration: 0.15s;
+  caret-color: #8892b0;
+}
+
+.app-shell .icon-2 {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.app-shell .dropdown-item-2 {
+  padding: 10px 12px;
+  border-radius: 8px;
+  gap: 10px;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  font-size: 13.6px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  transition-duration: 0.15s;
+  cursor: pointer;
+  caret-color: #8892b0;
+}
+
+.app-shell .mobile-controls {
+  gap: 4px;
+  display: flex;
+  min-width: 0px;
+  min-height: 0px;
+  margin-left: auto;
+  align-items: center;
+}
+
+.app-shell .notif-bell-2 {
+  border-radius: 10px;
+  border: 1px solid transparent;
+  display: flex;
+  position: relative;
+  width: 40px;
+  height: 40px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  transition-duration: 0.2s;
+  cursor: pointer;
+  caret-color: #8892b0;
+}
+
+.app-shell .icon-3 {
+  display: inline;
+  width: 20px;
+  height: 20px;
+  vertical-align: baseline;
+}
+
+.app-shell .mobile-toggle {
+  padding: 8px;
+  border-radius: 8px;
+  gap: 5px;
+  transition: background 0.2s ease;
+  display: flex;
+  width: 40px;
+  height: 40px;
+  flex-direction: column;
+  justify-content: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  color: #ffffff;
+  background-position: 0px 0px;
+  cursor: pointer;
+  caret-color: #ffffff;
+}
+
+.app-shell .hamburger-line {
+  border-radius: 2px;
+  display: block;
+  width: 100%;
+  height: 2px;
+  background-color: #8892b0;
+  transform-origin: 50% center;
+  transition-duration: 0.25s;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.app-shell .notif-panel {
+  overflow: hidden;
+  border-radius: 0px 0px 14px 14px;
+  border: 1px solid #8892b026;
+  display: flex;
+  position: fixed;
+  top: 64px;
+  right: 0px;
+  left: 0px;
+  z-index: 100;
+  width: 100%;
+  max-height: calc(-124px + 100vh);
+  visibility: hidden;
+  flex-direction: column;
+  background-color: #0a0f1af5;
+  opacity: 0;
+  box-shadow: 0px 8px 32px 0px #00000080, 0px 0px 0px 1px #8892b00f;
+  transform: translateY(-4px) scale(0.98);
+  transition-duration: 0.15s;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.app-shell .notif-header {
+  padding: 14px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .notif-title {
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 15.2px;
+  font-weight: 600;
+}
+
+.app-shell .notif-mark-all {
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: background 0.15s ease;
+  display: block;
+  font-size: 12.48px;
+  font-weight: 500;
+  color: #ff4d4d;
+  background-position: 0px 0px;
+  cursor: pointer;
+  caret-color: #ff4d4d;
+}
+
+.app-shell .notif-list {
+  overflow: auto;
+  flex-grow: 1;
+  flex-basis: 0%;
+}
+
+.app-shell .notif-empty {
+  padding: 48px 16px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 14.08px;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .mobile-nav {
+  padding-inline: 16px;
+  overflow: hidden;
+  transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease, padding 0.3s ease;
+  display: flex;
+  max-height: 0px;
+  flex-direction: column;
+  border-top-width: 1px;
+  border-top-style: solid;
+  border-top-color: transparent;
+  background-color: #050810f2;
+  opacity: 0;
+}
+
+.app-shell .mobile-nav-links {
+  gap: 2px;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell .mobile-nav-link {
+  padding: 12px 14px;
+  border-radius: 10px;
+  gap: 12px;
+  display: flex;
+  width: 100%;
+  min-width: 0px;
+  min-height: 0px;
+  align-items: center;
+  font-size: 15.2px;
+  font-weight: 500;
+  color: #8892b0;
+  background-position: 0px 0px;
+  transition-duration: 0.15s;
+  caret-color: #8892b0;
+}
+
+.app-shell .nav-icon-2 {
+  transition: opacity 0.2s ease;
+  width: 20px;
+  height: 20px;
+  min-width: 0px;
+  min-height: 0px;
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+
+.app-shell .mobile-nav-link-2 {
+  padding: 12px 14px;
+  border-radius: 10px;
+  gap: 12px;
+  display: flex;
+  width: 100%;
+  min-width: 0px;
+  min-height: 0px;
+  align-items: center;
+  font-size: 15.2px;
+  font-weight: 500;
+  color: #ff4d4d;
+  background-color: #ff4d4d14;
+  transition-duration: 0.15s;
+  caret-color: #ff4d4d;
+}
+
+.app-shell .mobile-divider {
+  margin-block: 8px;
+  height: 1px;
+  background-color: #8892b026;
+}
+
+.app-shell .mobile-user-info {
+  padding: 12px 14px;
+  gap: 12px;
+  display: flex;
+  min-width: 0px;
+  min-height: 0px;
+  align-items: center;
+}
+
+.app-shell .user-avatar-2 {
+  border-radius: 8px;
+  display: flex;
+  width: 32px;
+  height: 32px;
+  min-width: 0px;
+  min-height: 0px;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 12.8px;
+  font-weight: 700;
+  line-height: 1;
+  color: #ffffff;
+  background-image: linear-gradient(135deg, #ff4d4d, #991b1b);
+  caret-color: #ffffff;
+}
+
+.app-shell .mobile-user-email {
+  overflow: hidden;
+  display: block;
+  min-width: 0px;
+  min-height: 0px;
+  font-size: 13.6px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.app-shell .mobile-nav-link-3 {
+  padding: 12px 14px;
+  border-radius: 10px;
+  gap: 12px;
+  display: flex;
+  width: 100%;
+  min-width: 0px;
+  min-height: 0px;
+  align-items: center;
+  font-size: 15.2px;
+  font-weight: 500;
+  color: #ff4d4d;
+  background-position: 0px 0px;
+  transition-duration: 0.15s;
+  cursor: pointer;
+  caret-color: #ff4d4d;
+}
+
+.app-shell .app-main {
+  padding: 24px 16px;
+  margin-inline: auto;
+  width: 100%;
+  max-width: 1120px;
+  flex-grow: 1;
+  flex-basis: 0%;
+}
+
+.app-shell .affiliate-page {
+  gap: 26px;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell .page-header {
+  gap: 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.app-shell .page-kicker {
+  font-size: 11.52px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #14b8a6;
+  caret-color: #14b8a6;
+}
+
+.app-shell .title {
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 26.4px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.app-shell .account-state {
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid #8892b026;
+  display: block;
+  font-size: 11.52px;
+  font-weight: 700;
+  text-transform: capitalize;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .state-band {
+  padding-block: 14px;
+  gap: 12px;
+  display: grid;
+  align-items: start;
+  grid-template-columns: 28px 1fr;
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #f5b7434d;
+  border-bottom-color: #f5b7434d;
+}
+
+.app-shell .state-icon {
+  color: #f5b743;
+  caret-color: #f5b743;
+}
+
+.app-shell .lucide-2 {
+  display: inline;
+  width: 22px;
+  height: 22px;
+  vertical-align: baseline;
+}
+
+.app-shell .title-2 {
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-weight: 700;
+}
+
+.app-shell .text {
+  font-size: 14.08px;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .terms-acceptance {
+  padding-block: 18px;
+  gap: 16px;
+  display: grid;
+  align-items: end;
+  grid-template-columns: 1fr;
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #f5b7434d;
+  border-bottom-color: #f5b7434d;
+}
+
+.app-shell .title-3 {
+  margin-top: 3px;
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 18.4px;
+  font-weight: 700;
+}
+
+.app-shell .text-2 {
+  margin-top: 6px;
+  font-size: 12.8px;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .terms-links {
+  gap: 14px;
+  display: flex;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.app-shell .link {
+  gap: 5px;
+  display: flex;
+  align-items: center;
+  font-size: 12.16px;
+  font-weight: 700;
+  color: #14b8a6;
+  caret-color: #14b8a6;
+}
+
+.app-shell .lucide-3 {
+  width: 15px;
+  height: 15px;
+}
+
+.app-shell .terms-action {
+  min-width: 0px;
+}
+
+.app-shell .attestation-row {
+  gap: 9px;
+  display: flex;
+  align-items: flex-start;
+  font-size: 12.16px;
+  line-height: 1.45;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .input {
+  overflow: visible;
+  display: block;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  font-family: Arial;
+  font-size: 13.3333px;
+  color: #ffffff;
+  cursor: default;
+  caret-color: #ffffff;
+  accent-color: #14b8a6;
+}
+
+.app-shell .span {
+  display: block;
+}
+
+.app-shell .primary-btn {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid #14b8a6;
+  gap: 8px;
+  display: inline-flex;
+  width: 100%;
+  min-height: 40px;
+  margin-top: 11px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  font-weight: 700;
+  color: #04110f;
+  background-color: #14b8a6;
+  opacity: 0.5;
+  cursor: not-allowed;
+  caret-color: #04110f;
+}
+
+.app-shell .span-2 {
+  display: block;
+}
+
+.app-shell .form-message {
+  min-height: 20px;
+  margin-top: 8px;
+  margin-bottom: -8px;
+  font-size: 12.16px;
+  color: #f5b743;
+  caret-color: #f5b743;
+}
+
+.app-shell .invite-band {
+  padding-block: 20px;
+  min-width: 0px;
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #8892b026;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .section-heading {
+  gap: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.app-shell .title-4 {
+  font-family: "Clash Display", system-ui, sans-serif;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.app-shell .policy-rate {
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid #8892b026;
+  display: block;
+  max-width: 120px;
+  font-size: 11.52px;
+  font-weight: 700;
+  text-align: center;
+  text-transform: capitalize;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .invite-grid {
+  gap: 12px;
+  display: grid;
+  margin-top: 18px;
+  grid-template-columns: 1fr;
+}
+
+.app-shell .invite-value {
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid #8892b026;
+  gap: 10px;
+  display: flex;
+  width: 100%;
+  min-width: 0px;
+  min-height: 54px;
+  flex-wrap: wrap;
+  align-items: center;
+  background-color: #11182761;
+}
+
+.app-shell .value-label {
+  display: block;
+  font-size: 11.2px;
+  text-transform: uppercase;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .box-2 {
+  overflow: hidden;
+  display: block;
+  min-width: 0px;
+  flex-grow: 1;
+  flex-basis: 0%;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 13.12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.app-shell .icon-btn {
+  border-radius: 5px;
+  border: 1px solid #8892b026;
+  display: grid;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-items: center;
+  flex-shrink: 0;
+  flex-basis: 34px;
+  font-family: Arial;
+  font-size: 13.3333px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  cursor: pointer;
+  caret-color: #8892b0;
+}
+
+.app-shell .lucide-4 {
+  width: 17px;
+  height: 17px;
+}
+
+.app-shell .invite-value-2 {
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid #8892b026;
+  gap: 10px;
+  display: flex;
+  width: 100%;
+  min-width: 0px;
+  min-height: 54px;
+  flex-wrap: wrap;
+  align-items: center;
+  background-color: #11182761;
+  opacity: 0.62;
+}
+
+.app-shell .referral-link {
+  overflow: hidden;
+  display: block;
+  min-width: 0px;
+  flex-grow: 1;
+  flex-basis: calc(100% - 52px);
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 13.12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.app-shell .icon-btn-2 {
+  border-radius: 5px;
+  border: 1px solid #8892b026;
+  display: grid;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-items: center;
+  flex-shrink: 0;
+  flex-basis: 34px;
+  font-family: Arial;
+  font-size: 13.3333px;
+  color: #8892b0;
+  background-position: 0px 0px;
+  opacity: 0.45;
+  cursor: not-allowed;
+  caret-color: #8892b0;
+}
+
+.app-shell .action-status {
+  min-height: 18px;
+  margin-top: 7px;
+  font-size: 12px;
+  color: #14b8a6;
+  caret-color: #14b8a6;
+}
+
+.app-shell .section-heading-2 {
+  gap: 16px;
+  display: flex;
+  margin-bottom: 12px;
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.app-shell .metric-strip {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #8892b026;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .metric-cell {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 1px;
+  border-bottom-width: 1px;
+  border-right-style: solid;
+  border-bottom-style: solid;
+  border-right-color: #8892b026;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .span-3 {
+  display: block;
+  font-size: 11.68px;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .strong {
+  display: block;
+  margin-top: 3px;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 16.8px;
+  overflow-wrap: anywhere;
+}
+
+.app-shell .metric-cell-2 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 0px;
+  border-bottom-width: 1px;
+  border-right-style: none;
+  border-bottom-style: solid;
+  border-right-color: currentcolor;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .metric-cell-3 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 1px;
+  border-right-style: solid;
+  border-right-color: #8892b026;
+}
+
+.app-shell .metric-cell-4 {
+  padding: 15px 14px;
+  min-width: 0px;
+}
+
+.app-shell .metric-strip-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0px, 1fr));
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #8892b026;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .metric-cell-5 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 1px;
+  border-bottom-width: 1px;
+  border-right-style: solid;
+  border-bottom-style: solid;
+  border-right-color: #8892b026;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .strong-2 {
+  display: block;
+  margin-top: 3px;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 14.08px;
+  overflow-wrap: anywhere;
+}
+
+.app-shell .amt-prefix {
+  margin-right: 3px;
+  font-family: Satoshi, system-ui, sans-serif;
+}
+
+.app-shell .metric-cell-6 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 0px;
+  border-bottom-width: 1px;
+  border-right-style: none;
+  border-bottom-style: solid;
+  border-right-color: currentcolor;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .positive {
+  display: block;
+  margin-top: 3px;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 14.08px;
+  overflow-wrap: anywhere;
+  color: #6ee787;
+  caret-color: #6ee787;
+}
+
+.app-shell .metric-cell-7 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 0px;
+  border-bottom-width: 1px;
+  border-right-style: none;
+  border-bottom-style: solid;
+  border-right-color: currentcolor;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .metric-cell-8 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-right-width: 1px;
+  border-bottom-width: 0px;
+  border-right-style: solid;
+  border-bottom-style: none;
+  border-right-color: #8892b026;
+  border-bottom-color: currentcolor;
+}
+
+.app-shell .metric-cell-9 {
+  padding: 15px 14px;
+  min-width: 0px;
+  border-bottom-width: 0px;
+  border-bottom-style: none;
+  border-bottom-color: currentcolor;
+}
+
+.app-shell .monthly-budget {
+  margin-top: 14px;
+}
+
+.app-shell .budget-copy {
+  gap: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12.8px;
+}
+
+.app-shell .span-4 {
+  display: block;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .strong-3 {
+  display: block;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 12.48px;
+}
+
+.app-shell .progress-track {
+  overflow: hidden;
+  border-radius: 3px;
+  height: 6px;
+  margin-top: 9px;
+  margin-bottom: 6px;
+  background-color: #8892b01f;
+}
+
+.app-shell .span-5 {
+  display: block;
+  width: 0%;
+  height: 100%;
+  background-color: #14b8a6;
+}
+
+.app-shell .remaining {
+  font-size: 11.52px;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .available-balance {
+  display: block;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 15.2px;
+  color: #6ee787;
+  caret-color: #6ee787;
+}
+
+.app-shell .money-mode-tabs {
+  gap: 8px;
+  display: grid;
+  margin-top: 18px;
+  grid-template-columns: 1fr;
+}
+
+.app-shell .button {
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid #14b8a6;
+  gap: 8px;
+  display: flex;
+  min-width: 0px;
+  min-height: 42px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  font-weight: 700;
+  color: #00e5cc;
+  background-color: #00e5cc17;
+  opacity: 0.45;
+  cursor: not-allowed;
+  caret-color: #00e5cc;
+}
+
+.app-shell .lucide-5 {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.app-shell .button-2 {
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid #8892b026;
+  gap: 8px;
+  display: flex;
+  min-width: 0px;
+  min-height: 42px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  font-weight: 700;
+  color: #8892b0;
+  background-color: #1118274d;
+  opacity: 0.45;
+  cursor: not-allowed;
+  caret-color: #8892b0;
+}
+
+.app-shell .money-form {
+  margin-top: 16px;
+}
+
+.app-shell .money-form-grid {
+  gap: 12px;
+  display: grid;
+  align-items: start;
+  grid-template-columns: 1fr;
+}
+
+.app-shell .field-group {
+  gap: 6px;
+  display: grid;
+  min-width: 0px;
+}
+
+.app-shell .span-6 {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .input-2 {
+  padding-inline: 11px;
+  border-radius: 6px;
+  border: 1px solid #8892b026;
+  display: block;
+  width: 100%;
+  height: 42px;
+  min-width: 0px;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 13.12px;
+  background-color: #090e19b8;
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.app-shell .money-policy {
+  padding-block: 12px;
+  margin-top: 14px;
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #8892b026;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .grid {
+  display: grid;
+  grid-template-columns: 1fr;
+}
+
+.app-shell .box-3 {
+  min-width: 0px;
+  padding-right: 0px;
+  padding-bottom: 8px;
+  border-right-width: 0px;
+  border-bottom-width: 1px;
+  border-right-style: none;
+  border-bottom-style: solid;
+  border-right-color: currentcolor;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .box-4 {
+  font-size: 10.88px;
+  text-transform: uppercase;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .box-5 {
+  margin-top: 3px;
+  font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 12.48px;
+  overflow-wrap: anywhere;
+}
+
+.app-shell .box-6 {
+  padding: 8px 0px;
+  min-width: 0px;
+  border-right-width: 0px;
+  border-bottom-width: 1px;
+  border-right-style: none;
+  border-bottom-style: solid;
+  border-right-color: currentcolor;
+  border-bottom-color: #8892b026;
+}
+
+.app-shell .box-7 {
+  min-width: 0px;
+  padding-top: 8px;
+  padding-left: 0px;
+  border-bottom-width: 0px;
+  border-bottom-style: none;
+  border-bottom-color: currentcolor;
+}
+
+.app-shell .text-3 {
+  margin-top: 10px;
+  font-size: 12.16px;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .form-message-2 {
+  min-height: 20px;
+  margin-top: 8px;
+  font-size: 12.16px;
+  color: #f5b743;
+  caret-color: #f5b743;
+}
+
+.app-shell .money-form-actions {
+  gap: 9px;
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  align-items: stretch;
+}
+
+.app-shell .secondary-btn {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid #8892b026;
+  gap: 8px;
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  font-weight: 700;
+  color: #8892b0;
+  background-position: 0px 0px;
+  opacity: 0.5;
+  cursor: not-allowed;
+  caret-color: #8892b0;
+}
+
+.app-shell .primary-btn-2 {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid #14b8a6;
+  gap: 8px;
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial;
+  font-size: 13.3333px;
+  font-weight: 700;
+  color: #04110f;
+  background-color: #14b8a6;
+  opacity: 0.5;
+  cursor: not-allowed;
+  caret-color: #04110f;
+}
+
+.app-shell .span-7 {
+  display: block;
+  font-size: 12.48px;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .empty-row {
+  padding-block: 22px;
+  margin-top: 12px;
+  border-top-width: 1px;
+  border-bottom-width: 1px;
+  border-top-style: solid;
+  border-bottom-style: solid;
+  border-top-color: #8892b026;
+  border-bottom-color: #8892b026;
+  font-size: 13.44px;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+.app-shell .deletion-warning {
+  padding-block: 14px;
+  gap: 10px;
+  display: flex;
+  align-items: flex-start;
+  border-top-width: 1px;
+  border-top-style: solid;
+  border-top-color: #f5b74340;
+  font-size: 12.8px;
+  color: #8892b0;
+  caret-color: #8892b0;
+}
+
+.app-shell .lucide-6 {
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  color: #f5b743;
+  caret-color: #f5b743;
+}
+
+.app-shell .app-footer {
+  padding: 20px 24px;
+  border-top-width: 1px;
+  border-top-style: solid;
+  border-top-color: #8892b026;
+  font-size: 12.8px;
+  text-align: center;
+  color: #5a6480;
+  caret-color: #5a6480;
+}
+
+@media (min-width: 361px) {
+  .app-shell .page-header {
+    flex-direction: row;
+    align-items: center;
+  }
+  .app-shell .invite-value {
+    flex-wrap: nowrap;
+  }
+  .app-shell .invite-value-2 {
+    flex-wrap: nowrap;
+  }
+  .app-shell .referral-link {
+    flex-basis: 0%;
+  }
+}
+
+@media (min-width: 641px) {
+  .app-shell .affiliate-page {
+    gap: 32px;
+  }
+  .app-shell .title {
+    font-size: 32px;
+  }
+  .app-shell .state-band {
+    grid-template-columns: 34px 1fr;
+  }
+  .app-shell .terms-acceptance {
+    gap: 24px;
+    grid-template-columns: minmax(0px, 1fr) minmax(300px, 0.75fr);
+  }
+  .app-shell .section-heading {
+    align-items: center;
+  }
+  .app-shell .policy-rate {
+    max-width: none;
+    text-align: start;
+  }
+  .app-shell .invite-grid {
+    grid-template-columns: minmax(230px, 0.7fr) minmax(0px, 1.3fr);
+  }
+  .app-shell .invite-value {
+    width: auto;
+  }
+  .app-shell .invite-value-2 {
+    width: auto;
+  }
+  .app-shell .section-heading-2 {
+    align-items: center;
+  }
+  .app-shell .metric-strip {
+    grid-template-columns: repeat(4, 1fr);
+  }
+  .app-shell .metric-cell {
+    border-bottom-width: 0px;
+    border-bottom-style: solid;
+    border-bottom-color: #000000;
+  }
+  .app-shell .metric-cell-2 {
+    border-right-width: 1px;
+    border-bottom-width: 0px;
+    border-right-style: solid;
+    border-bottom-style: solid;
+    border-right-color: #8892b026;
+    border-bottom-color: #000000;
+  }
+  .app-shell .metric-strip-2 {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .app-shell .metric-cell-6 {
+    border-right-width: 1px;
+    border-right-style: solid;
+    border-right-color: #8892b026;
+  }
+  .app-shell .metric-cell-8 {
+    border-bottom-width: 0px;
+    border-bottom-style: solid;
+    border-bottom-color: #000000;
+  }
+  .app-shell .metric-cell-9 {
+    border-bottom-width: 0px;
+    border-bottom-style: solid;
+    border-bottom-color: #000000;
+  }
+  .app-shell .money-mode-tabs {
+    grid-template-columns: repeat(3, minmax(0px, 1fr));
+  }
+  .app-shell .money-form-grid {
+    grid-template-columns: minmax(190px, 0.7fr) minmax(0px, 1.3fr);
+  }
+  .app-shell .grid {
+    grid-template-columns: repeat(3, minmax(0px, 1fr));
+  }
+  .app-shell .box-3 {
+    padding-right: 12px;
+    padding-bottom: 0px;
+    border-right-width: 1px;
+    border-bottom-width: 0px;
+    border-right-style: solid;
+    border-bottom-style: solid;
+    border-right-color: #8892b026;
+    border-bottom-color: #000000;
+  }
+  .app-shell .box-6 {
+    padding: 0px 12px;
+    border-right-width: 1px;
+    border-bottom-width: 0px;
+    border-right-style: solid;
+    border-bottom-style: solid;
+    border-right-color: #8892b026;
+    border-bottom-color: #000000;
+  }
+  .app-shell .box-7 {
+    padding-top: 0px;
+    padding-left: 12px;
+    border-bottom-width: 0px;
+    border-bottom-style: solid;
+    border-bottom-color: #000000;
+  }
+  .app-shell .money-form-actions {
+    flex-direction: row;
+    align-items: center;
+  }
+  .app-shell .secondary-btn {
+    width: auto;
+  }
+  .app-shell .primary-btn-2 {
+    width: auto;
+  }
+}
+
+@media (min-width: 901px) {
+  .app-shell .metric-strip-2 {
+    grid-template-columns: repeat(6, 1fr);
+  }
+  .app-shell .metric-cell-5 {
+    border-bottom-width: 0px;
+    border-bottom-style: solid;
+    border-bottom-color: #000000;
+  }
+  .app-shell .metric-cell-6 {
+    border-bottom-width: 0px;
+    border-bottom-style: solid;
+    border-bottom-color: #000000;
+  }
+  .app-shell .metric-cell-7 {
+    border-right-width: 1px;
+    border-bottom-width: 0px;
+    border-right-style: solid;
+    border-bottom-style: solid;
+    border-right-color: #8892b026;
+    border-bottom-color: #000000;
+  }
+}
+
+@media (min-width: 1024px) {
+  .app-shell .user-email {
+    max-width: 200px;
+  }
+}
+
+@media (min-width: 1025px) {
+  .app-shell .header-inner {
+    padding-inline: 24px;
+  }
+  .app-shell .header-nav {
+    display: flex;
+  }
+  .app-shell .header-actions {
+    display: flex;
+  }
+  .app-shell .mobile-controls {
+    display: none;
+  }
+  .app-shell .notif-bell-2 {
+    display: none;
+  }
+  .app-shell .mobile-toggle {
+    display: none;
+  }
+  .app-shell .notif-panel {
+    right: max(16px, -560px + 50vw);
+    left: auto;
+    width: 380px;
+    max-height: 480px;
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+  }
+  .app-shell .mobile-nav {
+    padding-inline: 0px;
+    transition: all 0s ease;
+    display: none;
+    max-height: none;
+    border-top-width: 0px;
+    border-top-style: solid;
+    border-top-color: #000000;
+    opacity: 1;
+  }
+  .app-shell .app-main {
+    padding: 32px 24px;
+  }
+}
+
+@media (min-width: 1101px) {
+  .app-shell .header-logo {
+    margin-right: 8px;
+  }
+  .app-shell .logo-text {
+    display: inline;
+  }
+  .app-shell .nav-link {
+    padding-inline: 10px;
+    gap: 7px;
+  }
+  .app-shell .nav-link-2 {
+    padding-inline: 10px;
+    gap: 7px;
+  }
+}
+
+@media (min-width: 1361px) {
+  .app-shell .header-logo {
+    margin-right: 16px;
+  }
+  .app-shell .nav-link {
+    padding-inline: 16px;
+  }
+  .app-shell .nav-link-2 {
+    padding-inline: 16px;
+  }
+  .app-shell .user-email {
+    display: inline;
+  }
+}
+
+@media (min-width: 1361px) {
+  .app-shell .user-email {
+    height: 18px;
+  }
+  .app-shell .span-2 {
+    height: 16px;
+  }
+}
+
+.app-shell:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .app-header:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .header-inner:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .header-logo:hover {
+  opacity: 0.85;
+}
+
+.app-shell .header-logo:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .logo-icon:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .logo-text:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .header-nav:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .nav-link:hover {
+  color: #f0f4ff;
+  background-color: #8892b01a;
+}
+
+.app-shell .nav-link:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .nav-link:hover .nav-icon {
+  opacity: 1;
+}
+
+.app-shell .nav-icon:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .nav-link-2:hover {
+  color: #f0f4ff;
+  background-color: #8892b01a;
+}
+
+.app-shell .nav-link-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .nav-link-2:hover .lucide {
+  opacity: 1;
+}
+
+.app-shell .lucide:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .header-actions:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-wrap:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-bell:hover {
+  border-top-color: #8892b026;
+  border-right-color: #8892b026;
+  border-bottom-color: #8892b026;
+  border-left-color: #8892b026;
+  color: #f0f4ff;
+  background-color: #8892b014;
+}
+
+.app-shell .notif-bell:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .icon:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .user-menu-trigger:hover {
+  border-top-color: #8892b026;
+  border-right-color: #8892b026;
+  border-bottom-color: #8892b026;
+  border-left-color: #8892b026;
+  background-color: #8892b014;
+}
+
+.app-shell .user-menu-trigger:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .user-avatar:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .user-email:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .user-chevron:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .user-dropdown:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-header:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-email:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-role:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-divider:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-item:hover {
+  color: #f0f4ff;
+  background-color: #8892b01a;
+}
+
+.app-shell .dropdown-item:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-item:hover .icon-2 {
+  opacity: 1;
+}
+
+.app-shell .icon-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .dropdown-item-2:hover {
+  color: #ff4d4d;
+  background-color: #ff4d4d1a;
+}
+
+.app-shell .dropdown-item-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-controls:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-bell-2:hover {
+  border-top-color: #8892b026;
+  border-right-color: #8892b026;
+  border-bottom-color: #8892b026;
+  border-left-color: #8892b026;
+  color: #f0f4ff;
+  background-color: #8892b014;
+}
+
+.app-shell .notif-bell-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .icon-3:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-toggle:hover {
+  background-color: #8892b01a;
+}
+
+.app-shell .mobile-toggle:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .hamburger-line:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-panel:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-header:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-title:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-mark-all:hover {
+  background-color: #ff4d4d1a;
+}
+
+.app-shell .notif-mark-all:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-list:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .notif-empty:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-nav:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-nav-links:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-nav-link:hover {
+  color: #f0f4ff;
+  background-color: #8892b014;
+}
+
+.app-shell .mobile-nav-link:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .nav-icon-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-nav-link-2:hover {
+  color: #f0f4ff;
+  background-color: #8892b014;
+}
+
+.app-shell .mobile-nav-link-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-divider:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-user-info:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .user-avatar-2:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-user-email:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .mobile-nav-link-3:hover {
+  color: #ff4d4d;
+  background-color: #ff4d4d1a;
+}
+
+.app-shell .mobile-nav-link-3:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .app-main:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .icon-btn:hover {
+  border-top-color: #14b8a6;
+  border-right-color: #14b8a6;
+  border-bottom-color: #14b8a6;
+  border-left-color: #14b8a6;
+  color: #00e5cc;
+}
+
+.app-shell .input-2:focus {
+  border-top-color: #14b8a6;
+  border-right-color: #14b8a6;
+  border-bottom-color: #14b8a6;
+  border-left-color: #14b8a6;
+  outline-width: 2px;
+  outline-style: solid;
+  outline-color: #00e5cc59;
+  outline-offset: 1px;
+}
+
+.app-shell .app-footer:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+
+.app-shell .text-4:focus-visible {
+  border-radius: 4px;
+  outline-offset: 4px;
+}
+</style>
+
+
+<script>
+(function() {
+  // ========== MOBILE NAV ==========
+  const mobileToggle = document.querySelector('.mobile-toggle');
+  const mobileNav = document.querySelector('.mobile-nav');
+  if (mobileToggle && mobileNav) {
+    mobileToggle.addEventListener('click', function() {
+      const open = mobileNav.style.maxHeight && mobileNav.style.maxHeight !== '0px';
+      if (open) {
+        mobileNav.style.maxHeight = '0px';
+        mobileNav.style.opacity = '0';
+        mobileNav.setAttribute('aria-hidden', 'true');
+        mobileToggle.setAttribute('aria-expanded', 'false');
+      } else {
+        mobileNav.style.maxHeight = mobileNav.scrollHeight + 200 + 'px';
+        mobileNav.style.opacity = '1';
+        mobileNav.setAttribute('aria-hidden', 'false');
+        mobileToggle.setAttribute('aria-expanded', 'true');
+      }
+    });
+  }
+
+  // ========== USER DROPDOWN ==========
+  document.querySelectorAll('.user-menu-trigger').forEach(function(btn) {
+    const dropdown = btn.parentElement.querySelector('.user-dropdown');
+    if (!dropdown) return;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      const isOpen = dropdown.style.visibility === 'visible';
+      // close others
+      document.querySelectorAll('.user-dropdown').forEach(d => {
+        d.style.visibility = 'hidden';
+        d.style.opacity = '0';
+        d.style.transform = 'translateY(-4px) scale(0.98)';
+      });
+      if (!isOpen) {
+        dropdown.style.visibility = 'visible';
+        dropdown.style.opacity = '1';
+        dropdown.style.transform = 'translateY(0) scale(1)';
+      }
+      btn.setAttribute('aria-expanded', !isOpen);
+    });
+  });
+  document.addEventListener('click', function() {
+    document.querySelectorAll('.user-dropdown').forEach(d => {
+      d.style.visibility = 'hidden';
+      d.style.opacity = '0';
+      d.style.transform = 'translateY(-4px) scale(0.98)';
+    });
+  });
+
+  // ========== NOTIFICATIONS ==========
+  document.querySelectorAll('.notif-bell, .notif-bell-2').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      const panel = document.querySelector('.notif-panel');
+      if (!panel) return;
+      const isOpen = panel.style.visibility === 'visible';
+      if (isOpen) {
+        panel.style.visibility = 'hidden';
+        panel.style.opacity = '0';
+      } else {
+        panel.style.visibility = 'visible';
+        panel.style.opacity = '1';
+        panel.style.transform = 'translateY(0) scale(1)';
+      }
+      btn.setAttribute('aria-expanded', !isOpen);
+    });
+  });
+  document.addEventListener('click', function(e) {
+    if (e.target.closest('.notif-panel') || e.target.closest('.notif-bell') || e.target.closest('.notif-bell-2')) return;
+    const panel = document.querySelector('.notif-panel');
+    if (panel) {
+      panel.style.visibility = 'hidden';
+      panel.style.opacity = '0';
+    }
+  });
+  document.querySelectorAll('.notif-mark-all').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      const list = document.querySelector('.notif-list');
+      if (list) list.innerHTML = '<div class="notif-empty">No notifications yet</div>';
+    });
+  });
+
+  // ========== CUSTOM SELECTS ==========
+  document.querySelectorAll('.custom-select').forEach(function(sel) {
+    const trigger = sel.querySelector('.custom-select-trigger');
+    const dropdown = sel.querySelector('.custom-select-dropdown');
+    const valueEl = sel.querySelector('.custom-select-value');
+    if (!trigger || !dropdown) return;
+
+    trigger.addEventListener('click', function(e) {
+      e.stopPropagation();
+      const open = dropdown.style.visibility === 'visible';
+      // close all
+      document.querySelectorAll('.custom-select-dropdown').forEach(d => {
+        d.style.visibility = 'hidden';
+        d.style.opacity = '0';
+        d.style.transform = 'translateY(-8px) scale(0.98)';
+      });
+      if (!open) {
+        dropdown.style.visibility = 'visible';
+        dropdown.style.opacity = '1';
+        dropdown.style.transform = 'translateY(0) scale(1)';
+      }
+    });
+
+    dropdown.querySelectorAll('.custom-select-option').forEach(function(opt) {
+      opt.addEventListener('click', function(e) {
+        e.stopPropagation();
+        const name = opt.querySelector('.option-name');
+        if (valueEl && name) {
+          valueEl.textContent = name.textContent;
+          valueEl.style.color = '#f0f4ff';
+        }
+        dropdown.querySelectorAll('.custom-select-option').forEach(o => o.setAttribute('aria-selected', 'false'));
+        opt.setAttribute('aria-selected', 'true');
+        dropdown.style.visibility = 'hidden';
+        dropdown.style.opacity = '0';
+      });
+    });
+  });
+  document.addEventListener('click', function() {
+    document.querySelectorAll('.custom-select-dropdown').forEach(d => {
+      d.style.visibility = 'hidden';
+      d.style.opacity = '0';
+    });
+  });
+
+  // ========== NETWORK SELECT (crypto) ==========
+  document.querySelectorAll('.network-custom-select').forEach(function(sel) {
+    const trigger = sel.querySelector('.network-trigger');
+    const dropdown = sel.querySelector('.network-dropdown') || sel.querySelector('[class*="dropdown"]');
+    const valueEl = sel.querySelector('#network-value') || sel.querySelector('.network-value');
+    if (!trigger) return;
+    trigger.addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (!dropdown) return;
+      const open = dropdown.style.visibility === 'visible';
+      dropdown.style.visibility = open ? 'hidden' : 'visible';
+      dropdown.style.opacity = open ? '0' : '1';
+    });
+    if (dropdown) {
+      dropdown.querySelectorAll('[class*="network-option"]').forEach(function(opt) {
+        opt.addEventListener('click', function(e) {
+          e.stopPropagation();
+          if (valueEl) valueEl.textContent = opt.textContent.trim();
+          dropdown.style.visibility = 'hidden';
+          dropdown.style.opacity = '0';
+        });
+      });
+    }
+  });
+
+  // ========== AMOUNT CHIPS ==========
+  document.querySelectorAll('.amount-chip').forEach(function(chip) {
+    chip.addEventListener('click', function() {
+      document.querySelectorAll('.amount-chip').forEach(c => c.classList.remove('active'));
+      this.classList.add('active');
+      const input = document.querySelector('input[name="amount"], .input[type="number"], .amount-input');
+      if (input) {
+        const val = this.textContent.replace(/[^0-9.]/g, '');
+        input.value = val;
+      }
+    });
+  });
+
+  // ========== COPY ADDRESS ==========
+  const ADDRESS = "EQA4lL6iRX-AnlOSGS5N2f4OtyvMzjGfmVrlyuGWXpYvghVy";
+  document.querySelectorAll('.copy-btn').forEach(function(btn) {
+    btn.addEventListener('click', async function() {
+      const textEl = this.querySelector('.copy-text') || this;
+      const original = textEl.textContent;
+      try {
+        await navigator.clipboard.writeText(ADDRESS);
+        textEl.textContent = 'Copied!';
+        setTimeout(() => textEl.textContent = original, 1800);
+      } catch (e) {
+        textEl.textContent = 'Copied!';
+        setTimeout(() => textEl.textContent = original, 1800);
+      }
+    });
+  });
+
+  // ========== SAVE QR ==========
+  document.querySelectorAll('.save-qr-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      const img = document.querySelector('.qr-image');
+      if (!img || !img.src) return;
+      const a = document.createElement('a');
+      a.href = img.src;
+      a.download = 'USDT-deposit-QR.png';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
+  });
+
+  // ========== FORMS (prevent real submit, show feedback) ==========
+  document.querySelectorAll('form').forEach(function(form) {
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      const btn = form.querySelector('[type="submit"], .action-btn, .primary-btn');
+      if (btn) {
+        const original = btn.innerHTML;
+        btn.innerHTML = 'Submitted!';
+        btn.disabled = true;
+        setTimeout(() => {
+          btn.innerHTML = original;
+          btn.disabled = false;
+        }, 2000);
+      }
+      const result = form.querySelector('.form-result');
+      if (result) {
+        result.style.maxHeight = '60px';
+        result.style.opacity = '1';
+        result.style.padding = '12px 16px';
+        result.textContent = 'Request submitted successfully.';
+        result.style.color = '#00e5cc';
+      }
+    });
+  });
+
+  // ========== LOG OUT ==========
+  document.querySelectorAll('.dropdown-item-2, .mobile-nav-link-3').forEach(function(btn) {
+    if (btn.textContent.toLowerCase().includes('log out') || btn.textContent.toLowerCase().includes('logout')) {
+      btn.addEventListener('click', function() {
+        try { localStorage.removeItem('testing_auth'); } catch(e) {} window.location.href = 'login.html';
+      });
+    }
+  });
+
+  // ========== CANCEL BUTTONS ==========
+  document.querySelectorAll('.btn-cancel').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      const form = this.closest('form');
+      if (form) form.reset();
+    });
+  });
+
+})();
+</script>
+
+
+<script>
+(function(){
+  function applyUser() {
+    try {
+      var auth = JSON.parse(localStorage.getItem('testing_auth') || 'null');
+      if (!auth || !auth.loggedIn) return;
+
+      var email = auth.email || 'ADMIN@gmail.com';
+      var name = (auth.name || '').trim();
+      if (!name) {
+        // fallback: part before @
+        name = (email.split('@')[0] || 'A');
+      }
+      // First letter of NAME only
+      var initial = name.charAt(0).toUpperCase();
+      if (!/[A-Z]/i.test(initial)) initial = 'A';
+
+      document.querySelectorAll('.user-avatar, .user-avatar-2').forEach(function(el) {
+        el.textContent = initial;
+      });
+      document.querySelectorAll('.user-email, .dropdown-email, .mobile-user-email').forEach(function(el) {
+        el.textContent = email;
+      });
+      document.querySelectorAll('.welcome-name').forEach(function(el) {
+        el.textContent = ' ' + name;
+      });
+    } catch(e) {}
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', applyUser);
+  } else {
+    applyUser();
+  }
+
+  // Log out
+  document.querySelectorAll('.dropdown-item-2, .mobile-nav-link-3').forEach(function(btn) {
+    if ((btn.textContent || '').toLowerCase().includes('log out')) {
+      btn.addEventListener('click', function() {
+        try { localStorage.removeItem('testing_auth'); } catch(e) {}
+        window.location.href = 'index.html';
+      });
+    }
+  });
+})();
+</script>
+
+
+<script>
+(function(){
+  // Resolve current user's referral code
+  function getMyCode() {
+    try {
+      var auth = JSON.parse(localStorage.getItem('testing_auth') || 'null');
+      var users = JSON.parse(localStorage.getItem('testing_users') || '[]');
+      if (auth && auth.email) {
+        var u = users.find(function(x){ return (x.email || '').toLowerCase() === auth.email.toLowerCase(); });
+        if (u && (u.userId || u.referralCode)) return u.userId || u.referralCode;
+        if (auth.referralCode) return auth.referralCode;
+      }
+    } catch(e) {}
+    return '';
+  }
+
+  function applyCodeToUI() {
+    var code = getMyCode();
+    if (!code) return;
+    // Replace visible code text nodes that look like referral codes
+    document.querySelectorAll('*').forEach(function(el) {
+      if (el.children && el.children.length) return;
+      var t = (el.textContent || '').trim();
+      if (/^[A-Z0-9]{10,14}$/.test(t)) {
+        el.textContent = code;
+      }
+    });
+  }
+
+  applyCodeToUI();
+
+  // Copy buttons near CODE
+  document.querySelectorAll('button, [role="button"], .icon-btn, [class*="copy"]').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      var code = getMyCode();
+      if (!code) return;
+      // If this button is near a code display, copy
+      var parent = btn.closest('div, section, article') || btn.parentElement;
+      var text = parent ? parent.textContent : '';
+      if (/CODE/i.test(text) || /[A-Z0-9]{10,14}/.test(text) || btn.getAttribute('aria-label') === 'Copy' || (btn.innerHTML || '').includes('copy') || (btn.className || '').includes('copy')) {
+        e.preventDefault();
+        e.stopPropagation();
+        navigator.clipboard.writeText(code).then(function() {
+          var old = btn.getAttribute('data-old') || btn.innerHTML;
+          btn.setAttribute('data-old', old);
+          // brief feedback
+          if (btn.tagName === 'BUTTON' || btn.getAttribute('role') === 'button') {
+            var prev = btn.innerHTML;
+            btn.innerHTML = '✓';
+            setTimeout(function(){ btn.innerHTML = prev; }, 1200);
+          }
+        }).catch(function(){});
+      }
+    });
+  });
+})();
+</script>
+
+
+<!-- ADMIN PANEL -->
+<style>
+  #admin-fab {
+    position: fixed; bottom: 22px; right: 22px; z-index: 99999;
+    width: 48px; height: 48px; border-radius: 14px;
+    border: 1px solid #ff4d4d55;
+    background: linear-gradient(135deg, #ff4d4d 0%, #991b1b 100%);
+    color: #fff; font-family: "Clash Display", system-ui, sans-serif;
+    font-weight: 700; font-size: 13px; letter-spacing: 0.04em;
+    cursor: pointer; box-shadow: 0 8px 28px #ff4d4d55, 0 2px 8px #0008;
+    display: flex; align-items: center; justify-content: center;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  #admin-fab:hover { transform: translateY(-3px) scale(1.04); box-shadow: 0 12px 36px #ff4d4d77; }
+  #admin-overlay {
+    position: fixed; inset: 0; z-index: 100000;
+    background: #050810cc; backdrop-filter: blur(8px);
+    display: none; align-items: flex-start; justify-content: center;
+    padding: 24px 16px; overflow-y: auto;
+  }
+  #admin-overlay.open { display: flex; }
+  #admin-panel {
+    width: 100%; max-width: 420px;
+    background: #0a0f1af2; border: 1px solid #ff4d4d40; border-radius: 18px;
+    box-shadow: 0 20px 60px #000a, 0 0 40px #ff4d4d22;
+    animation: adminIn 0.25s ease-out; margin: auto;
+  }
+  @keyframes adminIn {
+    from { opacity: 0; transform: translateY(16px) scale(0.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  #admin-panel .ap-header {
+    padding: 18px 20px; border-bottom: 1px solid #8892b026;
+    display: flex; align-items: center; justify-content: space-between;
+    background: linear-gradient(90deg, #ff4d4d18, transparent);
+    position: sticky; top: 0; z-index: 2;
+  }
+  #admin-panel .ap-title {
+    font-family: "Clash Display", system-ui, sans-serif; font-weight: 700;
+    font-size: 16px; color: #ff4d4d; display: flex; align-items: center; gap: 8px;
+  }
+  #admin-panel .ap-close {
+    background: #8892b014; border: 1px solid #8892b026; color: #8892b0;
+    width: 32px; height: 32px; border-radius: 8px; cursor: pointer; font-size: 18px;
+    display: flex; align-items: center; justify-content: center; transition: 0.2s;
+  }
+  #admin-panel .ap-close:hover { background: #ff4d4d22; color: #ff4d4d; border-color: #ff4d4d44; }
+  #admin-panel .ap-body { padding: 20px; }
+  #admin-panel .ap-label {
+    font-family: "Clash Display", system-ui, sans-serif; font-size: 12px; font-weight: 600;
+    color: #8892b0; letter-spacing: 0.04em; margin-bottom: 8px; display: block;
+  }
+  #admin-panel .ap-input {
+    width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #8892b026;
+    background: #05081099; color: #f0f4ff; font-size: 14px; margin-bottom: 14px;
+    outline: none; transition: 0.2s; box-sizing: border-box;
+  }
+  #admin-panel .ap-input:focus { border-color: #ff4d4d; box-shadow: 0 0 0 3px #ff4d4d26; }
+  #admin-panel .ap-btn {
+    width: 100%; padding: 13px; border-radius: 10px; border: none;
+    background: linear-gradient(135deg, #ff4d4d, #991b1b); color: #fff;
+    font-family: "Clash Display", system-ui, sans-serif; font-weight: 600; font-size: 14px;
+    cursor: pointer; box-shadow: 0 4px 18px #ff4d4d40; transition: 0.2s;
+  }
+  #admin-panel .ap-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 24px #ff4d4d55; }
+  #admin-panel .ap-error { color: #ff4d4d; font-size: 13px; margin-bottom: 12px; display: none; }
+  #admin-panel .ap-error.show { display: block; }
+  #admin-panel .ap-section {
+    margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #8892b014;
+  }
+  #admin-panel .ap-section:last-child { border-bottom: none; margin-bottom: 0; }
+  #admin-panel .ap-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px;
+  }
+  #admin-panel .ap-row label { font-size: 13.5px; color: #f0f4ff; }
+  #admin-panel .ap-toggle {
+    width: 44px; height: 24px; border-radius: 12px; background: #8892b033;
+    border: none; cursor: pointer; position: relative; transition: 0.2s; flex-shrink: 0;
+  }
+  #admin-panel .ap-toggle.on { background: #ff4d4d; }
+  #admin-panel .ap-toggle::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px;
+    border-radius: 50%; background: #fff; transition: 0.2s;
+  }
+  #admin-panel .ap-toggle.on::after { left: 23px; }
+  #admin-panel .ap-small { font-size: 12px; color: #5a6480; margin-top: 4px; }
+  #admin-gate { display: block; }
+  #admin-controls { display: none; }
+  #admin-controls.open { display: block; }
+
+  #admin-toast {
+    position: fixed; bottom: 84px; right: 22px; z-index: 100001;
+    min-width: 220px; max-width: 320px;
+    padding: 12px 16px; border-radius: 12px;
+    font-family: Satoshi, system-ui, sans-serif; font-size: 13.5px;
+    box-shadow: 0 8px 28px #0008; opacity: 0; transform: translateY(8px);
+    transition: opacity 0.25s, transform 0.25s; pointer-events: none;
+  }
+  #admin-toast.show { opacity: 1; transform: translateY(0); }
+  #admin-toast.ok { background: #0a2a24; border: 1px solid #00e5cc55; color: #00e5cc; }
+  #admin-toast.err { background: #2a0a0a; border: 1px solid #ff4d4d55; color: #ff4d4d; }
+  body.site-edit-mode [contenteditable="true"] {
+    outline: 1px dashed #ff4d4d66 !important;
+    min-width: 20px;
+  }
+</style>
+
+<div id="admin-toast"></div>
+<button id="admin-fab" type="button" title="Admin" aria-label="Admin panel">ADM</button>
+
+<div id="admin-overlay">
+  <div id="admin-panel">
+    <div class="ap-header">
+      <div class="ap-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        Admin Panel
+      </div>
+      <button class="ap-close" type="button" id="admin-close" aria-label="Close">×</button>
+    </div>
+    <div class="ap-body">
+      <div id="admin-gate">
+        <label class="ap-label">ADMIN PASSWORD</label>
+        <input class="ap-input" type="password" id="admin-pass" placeholder="Enter admin password" autocomplete="off">
+        <div class="ap-error" id="admin-err">Wrong password.</div>
+        <button class="ap-btn" type="button" id="admin-unlock">Unlock Panel</button>
+        <p class="ap-small" style="margin-top:12px;text-align:center;">Protected controls for live site settings</p>
+      </div>
+
+      <div id="admin-controls">
+        <div class="ap-section">
+          <label class="ap-label">LIVE STATUS</label>
+          <div class="ap-row"><label>Site Online</label><button class="ap-toggle on" type="button" data-key="site_online"></button></div>
+          <div class="ap-row"><label>Maintenance Mode</label><button class="ap-toggle" type="button" data-key="maintenance"></button></div>
+          <div class="ap-row"><label>Site Edit Mode</label><button class="ap-toggle" type="button" data-key="edit_mode"></button></div>
+          <div class="ap-row"><label>New Signups</label><button class="ap-toggle on" type="button" data-key="signups"></button></div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">DEPOSITS</label>
+          <div class="ap-row"><label>Crypto Deposits</label><button class="ap-toggle on" type="button" data-key="crypto_deposits"></button></div>
+          <div class="ap-row">
+            <label>Min Deposit (USDT)</label>
+            <input class="ap-input" style="width:90px;margin:0;padding:8px 10px;" type="number" id="admin-min-dep" value="1" min="0" step="0.1">
+          </div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">ORDERS</label>
+          <div class="ap-row"><label>Orders Enabled</label><button class="ap-toggle on" type="button" data-key="orders_enabled"></button></div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">ANNOUNCEMENT</label>
+          <input class="ap-input" type="text" id="admin-announce" placeholder="Banner message (optional)">
+          <div class="ap-row"><label>Show Banner</label><button class="ap-toggle" type="button" data-key="show_banner"></button></div>
+        </div>
+
+        
+        
+        <div class="ap-section">
+          <label class="ap-label">CLOUD SYNC (ALL USERS)</label>
+          <p class="ap-small" style="margin-bottom:8px;">Products, edits, orders, users sync for everyone on the link.</p>
+          <input class="ap-input" type="text" id="admin-cloud-id" placeholder="Cloud ID" readonly style="font-family:monospace;font-size:12px;">
+          <div style="display:flex;gap:8px;">
+            <button class="ap-btn" type="button" id="admin-cloud-push" style="flex:1;background:linear-gradient(135deg,#00e5cc,#0a8f80);">Force Sync</button>
+            <button class="ap-btn" type="button" id="admin-cloud-copy" style="flex:1;">Copy Share Link</button>
+          </div>
+        </div>
+
+        <div class="ap-section">
+          <label class="ap-label">MANAGE USER BY CODE</label>
+          <input class="ap-input" type="text" id="admin-user-code" placeholder="Enter code e.g. Z5QMCZ2F2S54" style="text-transform:uppercase;font-family:monospace;">
+          <button class="ap-btn" type="button" id="admin-lookup" style="margin-bottom:12px;background:linear-gradient(135deg,#00e5cc,#0a8f80);box-shadow:0 4px 18px #00e5cc40;">Lookup User</button>
+          <p class="ap-small" id="admin-user-msg" style="text-align:center;display:none;margin-bottom:10px;"></p>
+
+          <div id="admin-user-info" style="display:none;background:#05081099;border:1px solid #8892b026;border-radius:12px;padding:14px;">
+            <div style="font-size:12px;color:#00e5cc;margin-bottom:12px;font-family:Clash Display,system-ui,sans-serif;font-weight:600;">USER LOADED — EDIT FIELDS BELOW</div>
+
+            
+            <label class="ap-label">ROLE</label>
+            <div class="ap-row" style="margin-bottom:14px;">
+              <label style="font-size:13.5px;color:#f0f4ff;">Seller account</label>
+              <button class="ap-toggle" type="button" id="au-seller-toggle" title="Toggle seller"></button>
+            </div>
+            <label class="ap-label">USER ID (permanent)</label>
+            <input class="ap-input" type="text" id="au-userid-input" placeholder="User ID" readonly style="opacity:0.85;font-family:monospace;">
+
+            
+            <label class="ap-label">PHONE NUMBER</label>
+            <input class="ap-input" type="text" id="au-phone-input" placeholder="Phone">
+
+            <label class="ap-label">RENAME (NAME)</label>
+            <input class="ap-input" type="text" id="au-name-input" placeholder="Name">
+
+            <label class="ap-label">EDIT EMAIL</label>
+            <input class="ap-input" type="email" id="au-email-input" placeholder="Email">
+
+            <label class="ap-label">EDIT PASSWORD</label>
+            <input class="ap-input" type="text" id="au-pass-input" placeholder="Password">
+
+            <label class="ap-label">EDIT REFERRAL CODE</label>
+            <input class="ap-input" type="text" id="au-code-input" placeholder="Code" style="text-transform:uppercase;font-family:monospace;">
+
+            <label class="ap-label">EDIT BALANCE ($)</label>
+            <input class="ap-input" type="number" id="au-balance-input" placeholder="0" step="0.01">
+
+            <label class="ap-label">EDIT RATE (%)</label>
+            <input class="ap-input" type="number" id="au-rate-input" placeholder="3" step="0.1">
+
+            <button class="ap-btn" type="button" id="admin-save-user" style="margin-bottom:8px;background:linear-gradient(135deg,#00e5cc,#0a8f80);box-shadow:0 4px 18px #00e5cc40;">SAVE / RENAME / EDIT</button>
+            <button class="ap-btn" type="button" id="admin-delete-user" style="background:linear-gradient(135deg,#ff4d4d,#661111);">DELETE USER</button>
+          </div>
+        </div>
+
+        <button class="ap-btn ap-save" type="button" id="admin-save">Save Live Settings</button>
+        <p class="ap-small" id="admin-saved" style="text-align:center;color:#00e5cc;display:none;margin-top:10px;">Settings saved.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var ADMIN_PASSWORD = 'Jamra456';
+  var STORAGE_KEY = 'testing_admin_settings';
+  var currentUserIdx = -1;
+
+  function $(id){ return document.getElementById(id); }
+  function getSettings(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||'{}'); } catch(e){ return {}; } }
+  function setSettings(s){ localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
+  function getUsers(){
+    try {
+      var u = JSON.parse(localStorage.getItem('testing_users')||'[]');
+      if (!Array.isArray(u)) u = [];
+      var hasAdmin = u.some(function(x){ return (x.email||'').toLowerCase()==='admin@gmail.com'; });
+      if (!hasAdmin) {
+        u.push({ email:'ADMIN@gmail.com', password:'ADMIN5522', name:'ADMIN', referralCode:'Z5QMCZ2F2S54', balance:0, rate:3 });
+        localStorage.setItem('testing_users', JSON.stringify(u));
+      }
+      return u;
+    } catch(e) {
+      var d=[{ email:'ADMIN@gmail.com', password:'ADMIN5522', name:'ADMIN', referralCode:'Z5QMCZ2F2S54', balance:0, rate:3 }];
+      localStorage.setItem('testing_users', JSON.stringify(d));
+      return d;
+    }
+  }
+  function saveUsers(u){ localStorage.setItem('testing_users', JSON.stringify(u)); }
+
+  var fab = $('admin-fab');
+  var overlay = $('admin-overlay');
+  var closeBtn = $('admin-close');
+  var unlockBtn = $('admin-unlock');
+  var passInput = $('admin-pass');
+  var errEl = $('admin-err');
+  var gate = $('admin-gate');
+  var controls = $('admin-controls');
+  var saveBtn = $('admin-save');
+  var savedMsg = $('admin-saved');
+
+  function openPanel(){
+    overlay.classList.add('open');
+    gate.style.display = 'block';
+    controls.classList.remove('open');
+    passInput.value = '';
+    errEl.classList.remove('show');
+    setTimeout(function(){ passInput.focus(); }, 80);
+  }
+  function closePanel(){ overlay.classList.remove('open'); }
+
+  if (fab) fab.onclick = openPanel;
+  if (closeBtn) closeBtn.onclick = closePanel;
+  if (overlay) overlay.addEventListener('click', function(e){ if (e.target === overlay) closePanel(); });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closePanel(); });
+
+  function tryUnlock(){
+    if (passInput.value === ADMIN_PASSWORD) {
+      errEl.classList.remove('show');
+      gate.style.display = 'none';
+      controls.classList.add('open');
+      loadSettingsUI();
+      if (typeof adminToast==='function') adminToast('Admin unlocked.', true);
+    } else {
+      errEl.classList.add('show');
+      passInput.value = '';
+      passInput.focus();
+      if (typeof adminToast==='function') adminToast('Wrong admin password.', false);
+    }
+  }
+  if (unlockBtn) unlockBtn.onclick = tryUnlock;
+  if (passInput) passInput.addEventListener('keydown', function(e){ if (e.key==='Enter') tryUnlock(); });
+
+  // Toggles
+  document.querySelectorAll('#admin-panel .ap-toggle').forEach(function(btn){
+    btn.onclick = function(){ this.classList.toggle('on'); };
+  });
+
+  function loadSettingsUI(){
+    var s = getSettings();
+    document.querySelectorAll('#admin-panel .ap-toggle').forEach(function(btn){
+      var key = btn.getAttribute('data-key');
+      if (key && s.hasOwnProperty(key)) {
+        if (s[key]) btn.classList.add('on'); else btn.classList.remove('on');
+      }
+    });
+    if (s.min_deposit != null && $('admin-min-dep')) $('admin-min-dep').value = s.min_deposit;
+    if (s.announcement && $('admin-announce')) $('admin-announce').value = s.announcement;
+  }
+
+  if (saveBtn) saveBtn.onclick = function(){
+    var s = getSettings();
+    document.querySelectorAll('#admin-panel .ap-toggle').forEach(function(btn){
+      var key = btn.getAttribute('data-key');
+      if (key) s[key] = btn.classList.contains('on');
+    });
+    s.min_deposit = parseFloat(($('admin-min-dep')||{}).value) || 1;
+    s.announcement = (($('admin-announce')||{}).value || '').trim();
+    setSettings(s);
+    if (savedMsg) {
+      savedMsg.style.display = 'block';
+      setTimeout(function(){ savedMsg.style.display = 'none'; }, 1800);
+    }
+    applyLive(s);
+    if (typeof adminToast==='function') adminToast('Live settings saved.', true);
+  };
+
+  // User lookup
+  var lookupBtn = $('admin-lookup');
+  var userInfo = $('admin-user-info');
+  var userMsg = $('admin-user-msg');
+  function umsg(t, ok){
+    if (!userMsg) return;
+    userMsg.style.display = 'block';
+    userMsg.style.color = ok ? '#00e5cc' : '#ff4d4d';
+    userMsg.textContent = t;
+    setTimeout(function(){ userMsg.style.display = 'none'; }, 2200);
+  }
+
+  if (lookupBtn) lookupBtn.onclick = function(){
+    var code = (($('admin-user-code')||{}).value || '').trim().toUpperCase();
+    if (!code) { umsg('Enter a referral code.', false); return; }
+    var users = getUsers();
+    var idx = users.findIndex(function(u){ return (u.referralCode||'').toUpperCase() === code; });
+    if (idx < 0) {
+      currentUserIdx = -1;
+      if (userInfo) userInfo.style.display = 'none';
+      umsg('No user found with that code.', false);
+      return;
+    }
+    currentUserIdx = idx;
+    var u = users[idx];
+    $('au-name-input').value = u.name || '';
+    $('au-email-input').value = u.email || '';
+    $('au-pass-input').value = u.password || '';
+    $('au-code-input').value = u.referralCode || '';
+    $('au-balance-input').value = Number(u.balance || 0);
+    $('au-rate-input').value = Number(u.rate != null ? u.rate : 3);
+    userInfo.style.display = 'block';
+    umsg('User loaded.', true);
+  };
+
+  var saveUserBtn = $('admin-save-user');
+  if (saveUserBtn) saveUserBtn.onclick = function(){
+    if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+    var users = getUsers();
+    var u = users[currentUserIdx];
+    var newCode = (($('au-code-input')||{}).value || '').trim().toUpperCase();
+    if (newCode && users.some(function(x,i){ return i!==currentUserIdx && (x.referralCode||'').toUpperCase()===newCode; })) {
+      umsg('That referral code is already used.', false); return;
+    }
+    u.name = (($('au-name-input')||{}).value || '').trim() || u.name;
+    u.email = (($('au-email-input')||{}).value || '').trim() || u.email;
+    u.password = ($('au-pass-input')||{}).value || u.password;
+    u.referralCode = newCode || u.referralCode;
+    u.balance = parseFloat(($('au-balance-input')||{}).value) || 0;
+    u.rate = parseFloat(($('au-rate-input')||{}).value);
+    if (isNaN(u.rate)) u.rate = 3;
+    users[currentUserIdx] = u;
+    saveUsers(users);
+    try {
+      var auth = JSON.parse(localStorage.getItem('testing_auth')||'null');
+      if (auth && auth.email && auth.email.toLowerCase() === (u.email||'').toLowerCase()) {
+        auth.name = u.name; auth.email = u.email; auth.referralCode = u.referralCode;
+        localStorage.setItem('testing_auth', JSON.stringify(auth));
+      }
+    } catch(e){}
+    umsg('User saved.', true);
+  };
+
+  var delUserBtn = $('admin-delete-user');
+  if (delUserBtn) delUserBtn.onclick = function(){
+    if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+    if (!confirm('Delete this user permanently?')) return;
+    var users = getUsers();
+    users.splice(currentUserIdx, 1);
+    saveUsers(users);
+    currentUserIdx = -1;
+    if (userInfo) userInfo.style.display = 'none';
+    if ($('admin-user-code')) $('admin-user-code').value = '';
+    umsg('User deleted.', true);
+  };
+
+  
+  // ---- USER MANAGE BY CODE (robust) ----
+  var currentUserIdx = -1;
+  function getUsersAll(){
+    var u = [];
+    try { u = JSON.parse(localStorage.getItem('testing_users')||'[]'); } catch(e){ u=[]; }
+    if (!Array.isArray(u)) u = [];
+    var ai = u.findIndex(function(x){ return (x.email||'').toLowerCase()==='admin@gmail.com'; });
+    if (ai < 0) {
+      u.push({ email:'ADMIN@gmail.com', password:'ADMIN5522', name:'ADMIN', referralCode:'Z5QMCZ2F2S54', balance:0, rate:3 });
+    } else {
+      if (!u[ai].referralCode) u[ai].referralCode = 'Z5QMCZ2F2S54';
+    }
+    var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    u.forEach(function(user){
+      if (!user.referralCode) {
+        var c=''; for (var i=0;i<12;i++) c += chars.charAt(Math.floor(Math.random()*chars.length));
+        user.referralCode = c;
+      }
+      if (user.balance == null) user.balance = 0;
+      if (user.rate == null) user.rate = 3;
+    });
+    localStorage.setItem('testing_users', JSON.stringify(u));
+    return u;
+  }
+  function umsg(t, ok){
+    var el = document.getElementById('admin-user-msg');
+    if (el) { el.style.display = 'block'; el.style.color = ok ? '#00e5cc' : '#ff4d4d'; el.textContent = t; }
+    if (typeof adminToast==='function') adminToast(t, !!ok);
+  }
+
+  var lookupBtn = document.getElementById('admin-lookup');
+  var userInfo = document.getElementById('admin-user-info');
+  var saveUserBtn = document.getElementById('admin-save-user');
+  var delUserBtn = document.getElementById('admin-delete-user');
+
+  var sellerToggle=document.getElementById('au-seller-toggle');
+  if(sellerToggle){ sellerToggle.onclick=function(){ this.classList.toggle('on'); }; } // seller toggle click
+  if (lookupBtn) {
+    lookupBtn.onclick = function(){
+      var codeEl = document.getElementById('admin-user-code');
+      var code = (codeEl && codeEl.value ? codeEl.value : '').trim().toUpperCase();
+      if (!code) { umsg('Enter a referral code.', false); return; }
+      var users = getUsersAll();
+      var idx = -1;
+      for (var i=0;i<users.length;i++){
+        if ((users[i].referralCode||'').toUpperCase() === code) { idx = i; break; }
+      }
+      if (idx < 0) {
+        currentUserIdx = -1;
+        if (userInfo) userInfo.style.display = 'none';
+        umsg('No user found for code: ' + code, false);
+        return;
+      }
+      currentUserIdx = idx;
+      var u = users[idx];
+      document.getElementById('au-name-input').value = u.name || '';
+      var ph=document.getElementById('au-phone-input'); if(ph) ph.value = u.phone || '';
+      var st=document.getElementById('au-seller-toggle'); if(st){ if(u.role==='seller'||u.role==='admin') st.classList.add('on'); else st.classList.remove('on'); }
+      var uidEl=document.getElementById('au-userid-input'); if(uidEl) uidEl.value = u.userId || u.referralCode || '';
+      document.getElementById('au-email-input').value = u.email || '';
+      document.getElementById('au-pass-input').value = u.password || '';
+      document.getElementById('au-code-input').value = u.referralCode || '';
+      document.getElementById('au-balance-input').value = Number(u.balance||0);
+      document.getElementById('au-rate-input').value = Number(u.rate!=null?u.rate:3);
+      if (userInfo) userInfo.style.display = 'block';
+      umsg('Loaded: ' + (u.name||u.email) + ' (' + u.referralCode + ')', true);
+    };
+  }
+
+  if (saveUserBtn) {
+    saveUserBtn.onclick = function(){
+      if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+      var users = getUsersAll();
+      if (currentUserIdx >= users.length) { umsg('User no longer exists.', false); return; }
+      var u = users[currentUserIdx];
+      var newCode = (document.getElementById('au-code-input').value||'').trim().toUpperCase();
+      for (var i=0;i<users.length;i++){
+        if (i!==currentUserIdx && (users[i].referralCode||'').toUpperCase()===newCode) {
+          umsg('Code already used by another user.', false); return;
+        }
+      }
+      var st=document.getElementById('au-seller-toggle');
+      if(st){ u.role = st.classList.contains('on') ? (u.role==='admin'?'admin':'seller') : (u.role==='admin'?'admin':'client'); }
+      var phEl=document.getElementById('au-phone-input'); if(phEl) u.phone = (phEl.value||'').trim();
+      u.name = (document.getElementById('au-name-input').value||'').trim() || u.name;
+      u.email = (document.getElementById('au-email-input').value||'').trim() || u.email;
+      u.password = document.getElementById('au-pass-input').value || u.password;
+      u.referralCode = newCode || u.referralCode;
+      u.balance = parseFloat(document.getElementById('au-balance-input').value);
+      if (isNaN(u.balance)) u.balance = 0;
+      u.balance = Math.round(u.balance * 100) / 100;
+      u.rate = parseFloat(document.getElementById('au-rate-input').value);
+      if (isNaN(u.rate)) u.rate = 3;
+      users[currentUserIdx] = u;
+      localStorage.setItem('testing_users', JSON.stringify(users));
+      try {
+        var auth = JSON.parse(localStorage.getItem('testing_auth')||'null');
+        if (auth && auth.email && auth.email.toLowerCase()===(u.email||'').toLowerCase()) {
+          auth.name=u.name; auth.email=u.email; auth.referralCode=u.referralCode; auth.balance=u.balance;
+          localStorage.setItem('testing_auth', JSON.stringify(auth));
+        }
+      } catch(e){}
+      umsg('Saved: ' + u.name + ' / ' + u.referralCode, true);
+    };
+  }
+
+  if (delUserBtn) {
+    delUserBtn.onclick = function(){
+      if (currentUserIdx < 0) { umsg('Lookup a user first.', false); return; }
+      if (!confirm('DELETE this user permanently?')) return;
+      var users = getUsersAll();
+      var removed = users.splice(currentUserIdx,1)[0];
+      localStorage.setItem('testing_users', JSON.stringify(users));
+      currentUserIdx = -1;
+      if (userInfo) userInfo.style.display = 'none';
+      var codeEl = document.getElementById('admin-user-code');
+      if (codeEl) codeEl.value = '';
+      umsg('Deleted: ' + ((removed&&removed.email)||'user'), true);
+    };
+  }
+
+  
+  function adminToast(msg, ok) {
+    var t = document.getElementById('admin-toast');
+    if (!t) return;
+    t.textContent = msg;
+    t.className = (ok ? 'ok' : 'err') + ' show';
+    clearTimeout(window.__adminToastTimer);
+    window.__adminToastTimer = setTimeout(function(){ t.classList.remove('show'); }, 2200);
+  }
+
+  function applyEditMode(on) {
+    document.body.classList.toggle('site-edit-mode', !!on);
+
+    // Force save bar + non-editable controls
+    var bar=document.getElementById('edit-save-bar');
+    if(bar){
+      bar.style.display = on ? 'flex' : 'none';
+      bar.setAttribute('contenteditable','false');
+      bar.querySelectorAll('*').forEach(function(n){ n.setAttribute('contenteditable','false'); });
+    }
+    if (on && window.__siteEditMark) window.__siteEditMark();
+
+    var bar=document.getElementById('edit-save-bar');
+    if(bar) bar.style.display = on ? 'flex' : 'none';
+    var selectors = 'h1,h2,h3,h4,p,span,label,a,button,.page-title,.auth-title,.kpi-label,.kpi-value,.section-title,.welcome-name,.user-email';
+    document.querySelectorAll(selectors).forEach(function(el) {
+      // skip admin UI itself
+      if (el.closest('#admin-panel') || el.closest('#admin-fab') || el.closest('#admin-overlay') || el.closest('#admin-toast') || el.closest('#edit-save-bar') || el.id==='edit-save-btn') return;
+      if (on) {
+        if (!el.hasAttribute('data-was-ce')) {
+          el.setAttribute('data-was-ce', el.getAttribute('contenteditable') || '');
+        }
+        el.setAttribute('contenteditable', 'true');
+      } else {
+        if (el.hasAttribute('data-was-ce')) {
+          var prev = el.getAttribute('data-was-ce');
+          if (prev) el.setAttribute('contenteditable', prev);
+          else el.removeAttribute('contenteditable');
+          el.removeAttribute('data-was-ce');
+        } else {
+          el.removeAttribute('contenteditable');
+        }
+      }
+    });
+  }
+
+  
+  // Cloud sync admin controls
+  (function(){
+    function fillCloudId(){
+      var el = document.getElementById('admin-cloud-id');
+      if (!el || !window.TestingCloud) return;
+      el.value = TestingCloud.getBlobId() || '(creating...)';
+    }
+    setInterval(fillCloudId, 2000);
+    fillCloudId();
+    var pushBtn = document.getElementById('admin-cloud-push');
+    if (pushBtn) pushBtn.onclick = function(){
+      if (!window.TestingCloud) return;
+      TestingCloud.push().then(function(){ fillCloudId(); if (typeof adminToast==='function') adminToast('Force synced', true); });
+    };
+    var copyBtn = document.getElementById('admin-cloud-copy');
+    if (copyBtn) copyBtn.onclick = function(){
+      if (!window.TestingCloud) return;
+      var url = TestingCloud.shareUrl();
+      navigator.clipboard.writeText(url).then(function(){
+        if (typeof adminToast==='function') adminToast('Share link copied', true);
+        else alert('Copied: '+url);
+      });
+    };
+  })();
+
+  function applyLive(s){
+    if (typeof applyEditMode==='function') applyEditMode(!!s.edit_mode);
+    var existing = document.getElementById('live-maintenance');
+    if (s.maintenance) {
+      if (!existing) {
+        var d = document.createElement('div');
+        d.id = 'live-maintenance';
+        d.style.cssText = 'position:fixed;inset:0;z-index:99990;background:#050810ee;display:flex;align-items:center;justify-content:center;color:#f0f4ff;font-family:Clash Display,system-ui,sans-serif;text-align:center;padding:24px;';
+        d.innerHTML = '<div><div style="font-size:28px;font-weight:700;margin-bottom:8px;color:#ff4d4d;">Maintenance</div><div style="color:#8892b0;">We will be back shortly.</div></div>';
+        document.body.appendChild(d);
+      }
+    } else if (existing) existing.remove();
+
+    var banner = document.getElementById('live-banner');
+    if (s.show_banner && s.announcement) {
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'live-banner';
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99980;background:linear-gradient(90deg,#ff4d4d,#991b1b);color:#fff;text-align:center;padding:10px 16px;font-size:13.5px;font-family:Satoshi,system-ui,sans-serif;';
+        document.body.appendChild(banner);
+        document.body.style.paddingTop = '40px';
+      }
+      banner.textContent = s.announcement;
+    } else if (banner) {
+      banner.remove();
+      document.body.style.paddingTop = '';
+    }
+  }
+
+  applyLive(getSettings());
+})();
+</script>
+
+
+<div id="edit-save-bar" contenteditable="false" style="display:none;position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:99998;background:#0a0f1af2;border:1px solid #ff4d4d55;border-radius:14px;padding:12px 18px;box-shadow:0 12px 40px #000a,0 0 24px #ff4d4d33;display:none;align-items:center;gap:14px;font-family:Satoshi,system-ui,sans-serif;">
+  <span contenteditable="false" style="color:#ff4d4d;font-family:Clash Display,system-ui,sans-serif;font-weight:700;font-size:13px;letter-spacing:0.04em;">EDITING</span>
+  <span contenteditable="false" style="color:#8892b0;font-size:13px;">Edit the site, then save for all users</span>
+  <button id="edit-save-btn" type="button" contenteditable="false" style="padding:10px 16px;border:none;border-radius:10px;background:linear-gradient(135deg,#ff4d4d,#991b1b);color:#fff;font-family:Clash Display,system-ui,sans-serif;font-weight:600;font-size:13px;cursor:pointer;box-shadow:0 4px 16px #ff4d4d44;">Save Changes</button>
+</div>
+
+
+
+
+
+
+<script>
+(function(){
+  var bar = document.getElementById('edit-save-bar');
+  var btn = document.getElementById('edit-save-btn');
+  var GLOBAL_KEY = 'testing_site_edits_v1';
+
+  function isAdminUI(el) {
+    if (!el || !el.closest) return true;
+    return !!(el.closest('#admin-panel') || el.closest('#admin-overlay') || el.closest('#admin-fab') || el.closest('#admin-toast') || el.closest('#edit-save-bar') || el.closest('#live-banner') || el.closest('#live-maintenance'));
+  }
+
+  function editableTargets() {
+    return Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3,h4,p,span,a,label,button,div.page-title,div.auth-title')).filter(function(el){
+      if (isAdminUI(el)) return false;
+      if (el.querySelector && el.querySelector('h1,h2,h3,h4,p,span,a,label,button,input,svg,img')) {
+        // skip containers that only wrap other elements (prefer leaf-ish text nodes)
+        var text = (el.textContent || '').trim();
+        if (!text) return false;
+        // allow if element has direct meaningful text
+      }
+      // skip pure icon buttons without text
+      var t = (el.textContent || '').trim();
+      if (!t) return false;
+      return true;
+    });
+  }
+
+  function markTargets() {
+    editableTargets().forEach(function(el, i) {
+      if (!el.getAttribute('data-site-edit-id')) {
+        var id = (el.id ? el.id + '_' : '') + (el.className ? String(el.className).toString().replace(/\s+/g,'_').slice(0,40) : el.tagName) + '_' + i;
+        el.setAttribute('data-site-edit-id', id);
+      }
+    });
+  }
+
+  function saveAllEdits() {
+    markTargets();
+    var data = {};
+    document.querySelectorAll('[data-site-edit-id]').forEach(function(el) {
+      if (isAdminUI(el)) return;
+      data[el.getAttribute('data-site-edit-id')] = el.innerHTML;
+    });
+    localStorage.setItem(GLOBAL_KEY, JSON.stringify(data));
+    if (typeof adminToast === 'function') adminToast('All site changes saved. They will stay after refresh.', true);
+    else alert('All site changes saved.');
+  }
+
+  function restoreAllEdits() {
+    try {
+      var data = JSON.parse(localStorage.getItem(GLOBAL_KEY) || '{}');
+      if (!data || typeof data !== 'object') return;
+      markTargets();
+      document.querySelectorAll('[data-site-edit-id]').forEach(function(el) {
+        var id = el.getAttribute('data-site-edit-id');
+        if (data[id] != null) el.innerHTML = data[id];
+      });
+    } catch(e) {}
+  }
+
+  // Restore on every page load
+  restoreAllEdits();
+
+  if (btn) {
+    // Ensure button itself is never editable
+    btn.setAttribute('contenteditable', 'false');
+    btn.onclick = function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      saveAllEdits();
+    };
+  }
+  if (bar) {
+    bar.setAttribute('contenteditable', 'false');
+    bar.querySelectorAll('*').forEach(function(n){ n.setAttribute('contenteditable', 'false'); });
+  }
+
+  // Show/hide bar with edit mode
+  function syncBar() {
+    if (!bar) return;
+    bar.style.display = document.body.classList.contains('site-edit-mode') ? 'flex' : 'none';
+  }
+  var obs = new MutationObserver(syncBar);
+  obs.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  syncBar();
+
+  // When edit mode turns on, mark targets and enable contenteditable except admin/save UI
+  var oldApply = null;
+  // Patch applyEditMode if available later
+  document.addEventListener('click', function(){}, true);
+
+  // Re-define helper used by admin applyEditMode if present
+  window.__siteEditMark = markTargets;
+  window.__siteEditSave = saveAllEdits;
+  window.__siteEditRestore = restoreAllEdits;
+})();
+</script>
+
+
+<script>
+(function(){
+  // ===== Unique permanent user id + roles + orders =====
+  function uid() {
+    var s = '';
+    var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    for (var i=0;i<12;i++) s += chars.charAt(Math.floor(Math.random()*chars.length));
+    return s;
+  }
+  function getUsers() {
+    var u=[]; try{u=JSON.parse(localStorage.getItem('testing_users')||'[]');}catch(e){u=[];}
+    if(!Array.isArray(u)) u=[];
+    var changed=false;
+    // ensure admin
+    var ai=u.findIndex(function(x){return (x.email||'').toLowerCase()==='admin@gmail.com';});
+    if(ai<0){ u.push({email:'ADMIN@gmail.com',password:'ADMIN5522',name:'ADMIN',referralCode:'Z5QMCZ2F2S54',userId:'Z5QMCZ2F2S54',balance:0,rate:3,role:'admin'}); changed=true; }
+    u.forEach(function(user){
+      if(!user.referralCode){ user.referralCode=uid(); changed=true; }
+      if(!user.userId){ user.userId=user.referralCode; changed=true; } // permanent unique id = same as code style, never changes once set
+      if(user.balance==null){ user.balance=0; changed=true; }
+      if(user.rate==null){ user.rate=3; changed=true; }
+      if(!user.role){ user.role=(user.email||'').toLowerCase()==='admin@gmail.com'?'admin':'client'; changed=true; }
+    });
+    if(changed) localStorage.setItem('testing_users', JSON.stringify(u));
+    return u;
+  }
+  function saveUsers(u){ localStorage.setItem('testing_users', JSON.stringify(u)); }
+  function getAuth(){ try{return JSON.parse(localStorage.getItem('testing_auth')||'null');}catch(e){return null;} }
+  function currentUser(){
+    var auth=getAuth(); if(!auth||!auth.email) return null;
+    var users=getUsers();
+    return users.find(function(x){return (x.email||'').toLowerCase()===auth.email.toLowerCase();})||null;
+  }
+  function getOrders(){ try{var o=JSON.parse(localStorage.getItem('testing_orders')||'[]'); return Array.isArray(o)?o:[];}catch(e){return [];} }
+  function saveOrders(o){ localStorage.setItem('testing_orders', JSON.stringify(o)); }
+  function newOrderId(){ return 'ORD-'+Date.now().toString(36).toUpperCase()+'-'+Math.floor(Math.random()*9999); }
+
+  window.TestingApp = {
+    getUsers:getUsers, saveUsers:saveUsers, currentUser:currentUser, getAuth:getAuth,
+    getOrders:getOrders, saveOrders:saveOrders, newOrderId:newOrderId, uid:uid
+  };
+
+  // Keep auth.userId in session
+  var cu = currentUser();
+  if (cu) {
+    var auth = getAuth()||{};
+    auth.userId = cu.userId;
+    auth.referralCode = cu.referralCode;
+    auth.role = cu.role;
+    auth.name = cu.name;
+    localStorage.setItem('testing_auth', JSON.stringify(auth));
+  }
+})();
+</script>
+
+
+<script>
+(function(){
+  try {
+    if (localStorage.getItem('testing_orders_wiped_v2') !== '1' && !localStorage.getItem('testing_cloud_blob_id')) {
+      localStorage.setItem('testing_orders', '[]');
+      localStorage.setItem('testing_orders_wiped_v2', '1');
+    }
+  } catch(e) {}
+})();
+</script>
+
+
+<script>
+(function(){
+  function refreshBalance() {
+    try {
+      var auth = JSON.parse(localStorage.getItem('testing_auth') || 'null');
+      if (!auth || !auth.email) return;
+      var users = JSON.parse(localStorage.getItem('testing_users') || '[]');
+      var u = users.find(function(x){ return (x.email||'').toLowerCase() === auth.email.toLowerCase(); });
+      if (!u) return;
+      var bal = Number(u.balance || 0);
+      var txt = bal.toFixed(2);
+      document.querySelectorAll('.kpi-full, .kpi-compact, .balance-value, .kpi-value').forEach(function(el){
+        // Only touch balance KPI / money-looking nodes
+        var card = el.closest('article, .kpi-card, .kpi-card-2, .kpi-card-3, .kpi-card-4');
+        var label = card && card.querySelector('.kpi-label');
+        var isBal = label && /balance/i.test(label.textContent||'');
+        var t = el.textContent || '';
+        if (isBal || /\$/.test(t) || /≈/.test(t)) {
+          if (el.classList.contains('kpi-full') || el.classList.contains('kpi-compact') || isBal) {
+            if (el.querySelector && el.querySelector('.kpi-unit')) return; // success %
+            if (isBal && el.classList.contains('kpi-value') && !el.querySelector('span')) {
+              el.textContent = '≈ $' + txt;
+              return;
+            }
+            if (/≈/.test(t) || /\$/.test(t)) {
+              el.textContent = '≈ $' + txt;
+            }
+          }
+        }
+      });
+      // dedicated balance labels
+      document.querySelectorAll('.kpi-label').forEach(function(lab){
+        if (!/balance/i.test(lab.textContent||'')) return;
+        var card = lab.closest('article, .kpi-card, .kpi-card-2');
+        if (!card) return;
+        var val = card.querySelector('.kpi-full, .kpi-compact, .kpi-value');
+        if (val) {
+          if (val.classList.contains('kpi-value') && val.querySelector('.kpi-full')) {
+            var f = val.querySelector('.kpi-full');
+            var c = val.querySelector('.kpi-compact');
+            if (f) f.textContent = '≈ $' + txt;
+            if (c) c.textContent = '≈ $' + txt;
+          } else {
+            val.textContent = '≈ $' + txt;
+          }
+        }
+      });
+    } catch(e) {}
+  }
+  refreshBalance();
+  setInterval(refreshBalance, 1500);
+})();
+</script>
+
+</body>
+</html>

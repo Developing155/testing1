@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Seller Products - TESTING</title>
+<style>
+:root { --bg:#050810; --card:#0a0f1ab3; --border:#8892b026; --text:#f0f4ff; --muted:#8892b0; --red:#ff4d4d; --cyan:#00e5cc; }
+html,body{margin:0;padding:0;background:#050810;color:var(--text);font-family:system-ui,sans-serif;min-height:100vh;}
+.wrap{max-width:900px;margin:0 auto;padding:28px 16px 80px;}
+h1{font-family:"Clash Display",system-ui,sans-serif;font-size:24px;margin:0 0 8px;}
+.sub{color:var(--muted);font-size:14px;margin-bottom:20px;}
+.card{border:1px solid var(--border);border-radius:14px;background:var(--card);padding:18px;margin-bottom:16px;}
+.label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.03em;}
+.input, textarea, select{
+  width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--border);
+  background:#05081099;color:#fff;font-size:14px;margin-bottom:12px;box-sizing:border-box;
+}
+textarea{min-height:80px}
+.btn{padding:12px 16px;border:none;border-radius:10px;cursor:pointer;font-weight:700;background:linear-gradient(135deg,#ff4d4d,#991b1b);color:#fff;}
+.btn-cyan{background:linear-gradient(135deg,#00e5cc,#0a8f80);}
+.btn-outline{background:transparent;border:1px solid var(--red);color:var(--red);}
+.row{display:flex;gap:10px;flex-wrap:wrap;}
+.field-row{display:flex;gap:8px;align-items:center;margin-bottom:8px;}
+.field-row input{margin:0;}
+.list-item{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:10px;background:#05081066;}
+.list-item img{width:56px;height:56px;object-fit:contain;background:#000;border-radius:8px;}
+.msg{font-size:13px;margin-top:8px;display:none;}
+a{color:var(--cyan);}
+</style>
+</head>
+<body>
+
+<script>
+(function(){
+  // ===== SHARED CLOUD STORE (all users on the link) =====
+  var BLOB_KEY = 'testing_cloud_blob_id';
+  var CACHE_KEY = 'testing_cloud_cache';
+  var META_KEY = 'testing_cloud_meta';
+  var API = 'https://jsonblob.com/api/jsonBlob';
+  var SAVE_DEBOUNCE_MS = 800;
+  var PULL_MS = 4000;
+  var saveTimer = null;
+  var pulling = false;
+  var applying = false;
+
+  function defaultData(){
+    return {
+      users: [],
+      products: [],
+      orders: [],
+      transactions: [],
+      siteEdits: {},
+      adminSettings: {},
+      updatedAt: Date.now()
+    };
+  }
+
+  function readLocalBundle(){
+    var data = defaultData();
+    try { data.users = JSON.parse(localStorage.getItem('testing_users')||'[]')||[]; } catch(e){}
+    try { data.products = JSON.parse(localStorage.getItem('testing_products')||'[]')||[]; } catch(e){}
+    try { data.orders = JSON.parse(localStorage.getItem('testing_orders')||'[]')||[]; } catch(e){}
+    try { data.transactions = JSON.parse(localStorage.getItem('testing_transactions')||'[]')||[]; } catch(e){}
+    try { data.adminSettings = JSON.parse(localStorage.getItem('testing_admin_settings')||'{}')||{}; } catch(e){}
+    // collect all site edit keys
+    data.siteEdits = {};
+    try {
+      for (var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if (k && k.indexOf('testing_site_edits')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+        if (k && k.indexOf('testing_page_edits_')===0) {
+          data.siteEdits[k] = JSON.parse(localStorage.getItem(k)||'{}');
+        }
+      }
+    } catch(e){}
+    data.updatedAt = Date.now();
+    return data;
+  }
+
+  function writeLocalBundle(data, skipAuth){
+    if (!data || typeof data !== 'object') return;
+    applying = true;
+    try {
+      if (Array.isArray(data.users)) localStorage.setItem('testing_users', JSON.stringify(data.users));
+      if (Array.isArray(data.products)) localStorage.setItem('testing_products', JSON.stringify(data.products));
+      if (Array.isArray(data.orders)) localStorage.setItem('testing_orders', JSON.stringify(data.orders));
+      if (Array.isArray(data.transactions)) localStorage.setItem('testing_transactions', JSON.stringify(data.transactions));
+      if (data.adminSettings) localStorage.setItem('testing_admin_settings', JSON.stringify(data.adminSettings));
+      if (data.siteEdits && typeof data.siteEdits === 'object') {
+        Object.keys(data.siteEdits).forEach(function(k){
+          try { localStorage.setItem(k, JSON.stringify(data.siteEdits[k])); } catch(e){}
+        });
+      }
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      localStorage.setItem(META_KEY, JSON.stringify({ updatedAt: data.updatedAt||Date.now() }));
+    } catch(e){}
+    applying = false;
+  }
+
+  function getBlobId(){ return localStorage.getItem(BLOB_KEY) || ''; }
+  function setBlobId(id){ if (id) localStorage.setItem(BLOB_KEY, id); }
+
+  async function createBlob(data){
+    var res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('create failed '+res.status);
+    // Location header: https://jsonblob.com/api/jsonBlob/{id}
+    var loc = res.headers.get('Location') || res.headers.get('location') || '';
+    var id = loc.split('/').pop();
+    if (!id) {
+      try { var j = await res.json(); id = j.id || j.blobId; } catch(e){}
+    }
+    if (!id) throw new Error('no blob id');
+    setBlobId(id);
+    return id;
+  }
+
+  async function putBlob(id, data){
+    var res = await fetch(API + '/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (res.status === 404) {
+      // recreate
+      return createBlob(data);
+    }
+    if (!res.ok) throw new Error('put failed '+res.status);
+    return id;
+  }
+
+  async function getBlob(id){
+    var res = await fetch(API + '/' + id, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error('get failed '+res.status);
+    return await res.json();
+  }
+
+  async function pushNow(){
+    if (applying) return;
+    var data = readLocalBundle();
+    try {
+      var id = getBlobId();
+      if (!id) id = await createBlob(data);
+      else id = await putBlob(id, data);
+      localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+      showSync('Synced to cloud', true);
+      return id;
+    } catch(e) {
+      console.warn('cloud push failed', e);
+      showSync('Cloud sync failed (will retry)', false);
+    }
+  }
+
+  function schedulePush(){
+    if (applying) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function(){ pushNow(); }, SAVE_DEBOUNCE_MS);
+  }
+
+  async function pullNow(forceApply){
+    if (pulling) return;
+    pulling = true;
+    try {
+      var id = getBlobId();
+      // If no id yet, try from URL param shared by admin
+      if (!id) {
+        var params = new URLSearchParams(location.search);
+        var qid = params.get('cloud') || params.get('sync');
+        if (qid) { setBlobId(qid); id = qid; }
+      }
+      if (!id) {
+        // first visitor creates the cloud store from local
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var remote = await getBlob(id);
+      if (!remote) {
+        await pushNow();
+        pulling = false;
+        return;
+      }
+      var meta = {};
+      try { meta = JSON.parse(localStorage.getItem(META_KEY)||'{}'); } catch(e){}
+      var remoteAt = Number(remote.updatedAt||0);
+      var localAt = Number(meta.updatedAt||0);
+      if (forceApply || remoteAt >= localAt) {
+        writeLocalBundle(remote);
+        // re-render dynamic bits if available
+        if (typeof window.__siteEditRestore === 'function') try { window.__siteEditRestore(); } catch(e){}
+        // soft reload products grid if function exists
+        if (document.getElementById('products-grid')) {
+          // trigger storage event consumers
+          try { window.dispatchEvent(new Event('testing-cloud-pull')); } catch(e){}
+        }
+      }
+    } catch(e) {
+      console.warn('cloud pull failed', e);
+    }
+    pulling = false;
+  }
+
+  function showSync(msg, ok){
+    var el = document.getElementById('cloud-sync-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'cloud-sync-toast';
+      el.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:100002;padding:8px 12px;border-radius:10px;font-size:12px;opacity:0;transition:opacity .25s;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    el.style.background = ok ? '#0a2a24' : '#2a0a0a';
+    el.style.border = ok ? '1px solid #00e5cc55' : '1px solid #ff4d4d55';
+    el.style.color = ok ? '#00e5cc' : '#ff4d4d';
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(window.__cloudToastTimer);
+    window.__cloudToastTimer = setTimeout(function(){ el.style.opacity = '0'; }, 1800);
+  }
+
+  // Patch localStorage setItem for our keys to auto-push
+  try {
+    var _set = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function(k, v){
+      _set(k, v);
+      if (applying) return;
+      if (!k) return;
+      if (k.indexOf('testing_') === 0 && k !== CACHE_KEY && k !== META_KEY && k !== BLOB_KEY && k !== 'testing_orders_wiped_v2') {
+        schedulePush();
+      }
+    };
+  } catch(e){}
+
+  // Expose API
+  window.TestingCloud = {
+    push: pushNow,
+    pull: pullNow,
+    getBlobId: getBlobId,
+    setBlobId: setBlobId,
+    shareUrl: function(){
+      var id = getBlobId();
+      if (!id) return location.href;
+      var u = new URL(location.href);
+      u.searchParams.set('cloud', id);
+      return u.toString();
+    }
+  };
+
+  // Admin: show cloud id + force sync buttons when panel opens
+  document.addEventListener('DOMContentLoaded', function(){
+    // inject share helpers into admin if present later
+  });
+
+  // Boot: pull then periodic pull
+  pullNow(true).then(function(){
+    // After first pull, if products empty seed still works via existing scripts
+  });
+  setInterval(function(){ pullNow(false); }, PULL_MS);
+
+  // Save site edits button should push
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    if (!t) return;
+    if (t.id === 'edit-save-btn' || (t.closest && t.closest('#edit-save-btn'))) {
+      setTimeout(function(){ pushNow(); }, 100);
+    }
+  });
+})();
+</script>
+
+<div class="wrap">
+  <a href="smscode-dashboard.html">← Dashboard</a>
+  <h1 style="margin-top:16px;">Seller — My Products</h1>
+  <p class="sub" id="access-msg">Only seller accounts can manage products.</p>
+
+  <div id="seller-ui" style="display:none;">
+    <div class="card">
+      <h2 style="margin:0 0 14px;font-size:16px;color:var(--red);">Add / Publish Product</h2>
+      <label class="label">PHONE NUMBER *</label>
+      <input class="input" id="s-phone" placeholder="+123456789">
+      <label class="label">PHOTO LINK *</label>
+      <input class="input" id="s-image" placeholder="https://...">
+      <label class="label">PRODUCT NAME *</label>
+      <input class="input" id="s-name" placeholder="Product name">
+      <label class="label">DESCRIPTION (optional)</label>
+      <textarea class="input" id="s-desc" placeholder="Describe the product"></textarea>
+      <label class="label">PRICE ($)</label>
+      <input class="input" id="s-price" type="number" min="0" step="0.01" value="1">
+      <label class="label">STOCK (how many available) *</label>
+      <input class="input" id="s-stock" type="number" min="0" step="1" value="1">
+      <label class="label">ORDER QUESTIONS (what client must fill)</label>
+      <div id="fields-list"></div>
+      <button class="btn btn-outline" type="button" id="add-field" style="margin-bottom:12px;">+ Add question</button>
+      <div class="row">
+        <button class="btn" type="button" id="publish">Publish Product</button>
+      </div>
+      <div class="msg" id="msg"></div>
+    </div>
+
+    <h2 style="font-size:16px;margin:8px 0 12px;">All products</h2>
+    <div id="my-products"></div>
+  </div>
+</div>
+<script>
+(function(){
+  function getProducts(){ try{var p=JSON.parse(localStorage.getItem('testing_products')||'[]');return Array.isArray(p)?p:[];}catch(e){return [];} }
+  function saveProducts(p){ localStorage.setItem('testing_products', JSON.stringify(p)); }
+  function getUsers(){ try{return JSON.parse(localStorage.getItem('testing_users')||'[]');}catch(e){return [];} }
+  function getAuth(){ try{return JSON.parse(localStorage.getItem('testing_auth')||'null');}catch(e){return null;} }
+
+  var auth = getAuth();
+  if (!auth || !auth.loggedIn) { location.href='index.html'; return; }
+  var users = getUsers();
+  var user = users.find(function(u){ return (u.email||'').toLowerCase()===(auth.email||'').toLowerCase(); });
+  var isSeller = user && (user.role==='seller' || user.role==='admin');
+  if (!isSeller) {
+    document.getElementById('access-msg').textContent = 'You are not a seller. Ask admin to enable Seller on your account.';
+    return;
+  }
+  document.getElementById('access-msg').textContent = 'Logged in as seller: ' + (user.name||user.email);
+  document.getElementById('seller-ui').style.display = 'block';
+
+  var fields = [];
+  function renderFields(){
+    var box = document.getElementById('fields-list');
+    box.innerHTML = '';
+    fields.forEach(function(f, i){
+      var row = document.createElement('div');
+      row.className = 'field-row';
+      row.innerHTML = '<input class="input" style="margin:0;flex:1" placeholder="Question label" value="'+(f.label||'')+'">'
+        + '<label style="font-size:12px;color:#8892b0;white-space:nowrap;"><input type="checkbox" '+(f.required?'checked':'')+'> Required</label>'
+        + '<button type="button" class="btn btn-outline" style="padding:8px 10px;">✕</button>';
+      var inputs = row.querySelectorAll('input');
+      inputs[0].oninput = function(){ fields[i].label = this.value; };
+      inputs[1].onchange = function(){ fields[i].required = this.checked; };
+      row.querySelector('button').onclick = function(){ fields.splice(i,1); renderFields(); };
+      box.appendChild(row);
+    });
+  }
+  document.getElementById('add-field').onclick = function(){
+    fields.push({ label:'', required:true, type:'text' });
+    renderFields();
+  };
+
+  function show(t, ok){
+    var m=document.getElementById('msg'); m.style.display='block'; m.style.color=ok?'#00e5cc':'#ff4d4d'; m.textContent=t;
+  }
+
+  document.getElementById('publish').onclick = function(){
+    var phone = document.getElementById('s-phone').value.trim();
+    var image = document.getElementById('s-image').value.trim();
+    var name = document.getElementById('s-name').value.trim();
+    var desc = document.getElementById('s-desc').value.trim();
+    var price = parseFloat(document.getElementById('s-price').value)||0;
+    var stock = parseInt(document.getElementById('s-stock').value);
+    if (!phone || !image || !name) { show('Phone, photo link and name are required.', false); return; }
+    if (isNaN(stock) || stock < 0) { show('Enter a valid stock amount.', false); return; }
+    var cleanFields = fields.filter(function(f){ return (f.label||'').trim(); }).map(function(f){
+      return { label:f.label.trim(), required:!!f.required, type:f.type||'text' };
+    });
+    var id = name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'') + '-' + Date.now().toString(36);
+    var products = getProducts();
+    products.unshift({
+      id: id,
+      name: name,
+      price: price,
+      stock: stock,
+      image: image,
+      desc: desc,
+      fields: cleanFields,
+      sellerEmail: user.email,
+      sellerName: user.name,
+      phone: phone,
+      createdAt: Date.now()
+    });
+    saveProducts(products);
+    // save phone on seller profile for admin lookup
+    try {
+      var users = getUsers();
+      var ui = users.findIndex(function(x){ return (x.email||'').toLowerCase()===(user.email||'').toLowerCase(); });
+      if (ui>=0) { users[ui].phone = phone; localStorage.setItem('testing_users', JSON.stringify(users)); }
+    } catch(e) {}
+    show('Product published.', true);
+    document.getElementById('s-name').value='';
+    document.getElementById('s-desc').value='';
+    document.getElementById('s-image').value='';
+    fields=[]; renderFields();
+    renderMine();
+  };
+
+  function renderMine(){
+    var products = getProducts();
+    var box = document.getElementById('my-products');
+    if (!products.length) { box.innerHTML = '<p style="color:#5a6480">No products yet.</p>'; return; }
+    box.innerHTML = '';
+    products.forEach(function(p){
+      var el = document.createElement('div');
+      el.className = 'list-item';
+      var owner = p.sellerName || p.sellerEmail || 'system';
+      el.innerHTML = '<div style="display:flex;gap:12px;align-items:center;min-width:0;">'
+        + '<img src="'+p.image+'" alt="" style="background:#000">'
+        + '<div style="min-width:0;"><div style="font-weight:700;">'+p.name+'</div>'
+        + '<div style="font-size:12px;color:#8892b0;">$'+Number(p.price||0).toFixed(2)+' · Stock: '+Number(p.stock||0)+' · by '+owner+'</div></div></div>'
+        + '<div class="row">'
+        + '<a class="btn btn-cyan" style="padding:8px 12px;text-decoration:none;" href="product.html?id='+encodeURIComponent(p.id)+'">Open</a>'
+        + '<button class="btn btn-outline" style="padding:8px 12px;" data-del="'+p.id+'">Delete</button>'
+        + '</div>';
+      box.appendChild(el);
+    });
+    box.querySelectorAll('[data-del]').forEach(function(btn){
+      btn.onclick = function(){
+        if (!confirm('Delete this product for everyone?')) return;
+        var id = btn.getAttribute('data-del');
+        var products = getProducts().filter(function(p){ return p.id !== id; });
+        saveProducts(products);
+    // save phone on seller profile for admin lookup
+    try {
+      var users = getUsers();
+      var ui = users.findIndex(function(x){ return (x.email||'').toLowerCase()===(user.email||'').toLowerCase(); });
+      if (ui>=0) { users[ui].phone = phone; localStorage.setItem('testing_users', JSON.stringify(users)); }
+    } catch(e) {}
+        renderMine();
+      };
+    });
+  }
+  renderMine();
+})();
+</script>
+
+<script>
+(function(){
+  try {
+    if (localStorage.getItem('testing_orders_wiped_v2') !== '1' && !localStorage.getItem('testing_cloud_blob_id')) {
+      localStorage.setItem('testing_orders', '[]');
+      localStorage.setItem('testing_orders_wiped_v2', '1');
+    }
+  } catch(e) {}
+})();
+</script>
+
+</body>
+</html>
